@@ -1,0 +1,301 @@
+#!/bin/sh /etc/rc.common
+# nxsb service: stored panel (SFL) config + router overlay -> validate -> run the core under procd.
+
+START=99
+STOP=10
+USE_PROCD=1
+
+BIN=/usr/bin/nxsb
+LIB=/usr/lib/nxsb
+RUN=/var/run/nxsb
+DATA=/etc/nxsb
+CONF=$RUN/config.json
+# dnsmasq's conf-dir is per instance on 24.10 (/tmp/dnsmasq.<cfg>.d); read them from the generated configs.
+# Every instance gets our drop-ins (guest networks often run their own). No dnsmasq, or dnsmasq installed but
+# not running (AdGuard Home / unbound setups keep it disabled) -> empty: we must never start it ourselves.
+# Only instances that serve DNS: one with port=0 does DHCP only (guest networks often run such a second one).
+_dnsmasq_confdirs() {
+	[ -x /etc/init.d/dnsmasq ] && [ -n "$(pidof dnsmasq)" ] || return 0
+	local f d
+	ls /var/etc/dnsmasq.conf.* >/dev/null 2>&1 || { echo /tmp/dnsmasq.d; return 0; }   # older layout: one instance, no generated conf
+	for f in /var/etc/dnsmasq.conf.*; do
+		grep -qs '^port=0' "$f" && continue
+		d="$(sed -n 's/^conf-dir=//p' "$f" | head -1)"; echo "${d:-/tmp/dnsmasq.d}"
+	done | sort -u
+}
+# dnsmasq is running but every instance is DHCP-only: no DNS to hijack
+_dnsmasq_dhcp_only() { [ -n "$(pidof dnsmasq)" ] && [ -z "$(_dnsmasq_confdirs)" ]; }
+# restart dnsmasq and say so if it does not come back (a rejected drop-in would leave the LAN without DNS)
+_dnsmasq_restart() {
+	[ -n "$(pidof dnsmasq)" ] || return 0
+	/etc/init.d/dnsmasq restart >/dev/null 2>&1; sleep 1
+	[ -n "$(pidof dnsmasq)" ] || { _event "ERROR dnsmasq did not come back after the restart: LAN DNS is down; check 'logread -e dnsmasq' and remove /tmp/dnsmasq*.d/nxsb*.conf if they are the cause"; return 1; }
+	return 0
+}
+_dnsmasq_confdir() { _dnsmasq_confdirs | head -1; }
+# listening sockets, whichever tool the image has; with owner names so our own core is not mistaken for a stranger
+_listening() { ss -lnp$1 2>/dev/null || netstat -lnp$1 2>/dev/null; }
+# is TCP/UDP port $2 (proto $1: t|u) held by something other than the core?
+_port_taken() { _listening "$1" | grep -E "[:.]$2 " | grep -qv "nxsb"; }
+
+# service events: persistent (start/stop/errors are rare, so a flash write each is fine) and still there after a reboot
+EVENTS=$DATA/events.log
+_event() { mkdir -p $DATA; echo "$(date '+%F %T') $*" >> $EVENTS; tail -n 200 $EVENTS > $EVENTS.tmp 2>/dev/null && mv -f $EVENTS.tmp $EVENTS; logger -t nxsb "$*"; }
+
+extra_command "check" "Generate and validate the configuration without starting"
+extra_command "reset" "Restore default settings (keeps the subscription URL); 'reset full' also drops the subscription and cache"
+extra_command "destroy" "Stop and wipe the core working directory (subscription, cache, rule-set downloads); settings are kept"
+extra_command "generate" "Print the generated configuration"
+extra_command "hijack_refresh" "Rewrite the dnsmasq drop-in if the ISP resolver changed (hotplug)"
+extra_command "diag" "Run the diagnostics (same as the Log page button)"
+
+# DNS listener port: Settings value, or the next free loopback port if something else already holds it
+_dns_port() {
+	local want p; want="$(uci -q get nxsb.main.dns_listen_port)"; want="${want:-5335}"
+	[ -f $RUN/dns.port ] && [ -n "$(pidof nxsb)" ] && { cat $RUN/dns.port; return; }   # keep the port of a running core
+	p=$want
+	while _port_taken u $p; do p=$((p+1)); done
+	[ "$p" != "$want" ] && _event "DNS listener port $want is in use by another program, using $p"
+	[ -n "$NXSB_NOWRITE" ] || { mkdir -p $RUN; echo $p > $RUN/dns.port; }
+	echo $p
+}
+
+# dashboard/API secret: empty by default (LAN only, fw4 keeps it off the WAN); set one in Settings if wanted
+_api_secret() { uci -q get nxsb.main.api_secret; }
+# API/dashboard port: Settings value, or the next free one if another program already listens there
+_api_port() {
+	local want p; want="$(uci -q get nxsb.main.api_port)"; want="${want:-9091}"
+	[ -f $RUN/api.port ] && [ -n "$(pidof nxsb)" ] && { cat $RUN/api.port; return; }
+	p=$want
+	while _port_taken t $p; do p=$((p+1)); done
+	[ "$p" != "$want" ] && _event "API port $want is in use by another program, using $p"
+	[ -n "$NXSB_NOWRITE" ] || { mkdir -p $RUN; echo $p > $RUN/api.port; }
+	echo $p
+}
+
+_generate() {
+	mkdir -p $RUN $DATA
+	NXSB_DNS_PORT="$(_dns_port)" NXSB_API_PORT="$(_api_port)" NXSB_API_SECRET="$(_api_secret)" ucode $LIB/generate.uc > "$1" 2>$RUN/generate.err || {
+		_event "ERROR config generation failed: $(cat $RUN/generate.err)"
+		return 1
+	}
+}
+
+_check() {
+	[ -x $BIN ] || { _event "ERROR core not installed (Settings » Core)"; return 1; }
+	$BIN check -c "$1" -D $DATA >$RUN/check.out 2>&1 || {
+		_event "ERROR config check failed: $(head -3 $RUN/check.out | sed "s/$(printf '\033')\[[0-9;]*m//g")"
+		return 1
+	}
+}
+
+# LAN DNS: dnsmasq asks the core first (loopback listener); if the core is down the query fails
+# instantly (connection refused) and strict-order falls through to the ISP resolver, i.e. the
+# pre-install behaviour. Never leaves the LAN without DNS.
+_dns_hijack_on() {
+	local port up d changed=0 dirs
+	dirs="$(_dnsmasq_confdirs)"
+	[ -n "$dirs" ] || { _dnsmasq_dhcp_only && _event "dnsmasq serves DHCP only (port=0): LAN DNS is not through the core. Point your resolver at 127.0.0.1#$(cat $RUN/dns.port 2>/dev/null || echo 5335)" || _event "dnsmasq is not running: LAN DNS is not sent through the core. Point your resolver at 127.0.0.1#$(cat $RUN/dns.port 2>/dev/null || echo 5335)"; return 0; }
+	port="$(cat $RUN/dns.port 2>/dev/null)"; port="${port:-5335}"
+	up="$(awk '/^nameserver/ && $2 != "127.0.0.1" && $2 != "::1" {print $2; exit}' /tmp/resolv.conf.d/resolv.conf.auto 2>/dev/null)"
+	# dnsmasq with its own forwarders (Network » DHCP and DNS » Forwards) tries those before ours: say so once
+	if grep -qs '^server=[0-9]' /var/etc/dnsmasq.conf.* 2>/dev/null && [ ! -f $RUN/warned.forwards ]; then
+		_event "dnsmasq has its own DNS forwards configured; they are asked before the core (remove them in Network » DHCP and DNS » Forwards)"; touch $RUN/warned.forwards
+	fi
+	for d in $dirs; do
+		mkdir -p "$d"
+		{
+			echo "# nxsb: core first, ISP resolver as fallback"
+			# no WAN resolver known yet (boot before WAN is up): keep dnsmasq's own resolv-file as the fallback
+			[ -n "$up" ] && echo "no-resolv"
+			echo "strict-order"
+			echo "server=127.0.0.1#$port"
+			[ -n "$up" ] && echo "server=$up"
+		} > "$d/nxsb.conf.new"
+		if ! cmp -s "$d/nxsb.conf.new" "$d/nxsb.conf" 2>/dev/null; then mv -f "$d/nxsb.conf.new" "$d/nxsb.conf"; changed=1; else rm -f "$d/nxsb.conf.new"; fi
+	done
+	[ $changed = 1 ] && _dnsmasq_restart
+	return 0
+}
+_dns_hijack_off() {
+	local f found=0
+	for f in /tmp/dnsmasq.d/nxsb.conf /tmp/dnsmasq.*.d/nxsb.conf; do [ -f "$f" ] && { rm -f "$f" "$f.new"; found=1; }; done
+	[ $found = 1 ] && _dnsmasq_restart
+	return 0
+}
+
+CRON_LINE="17 * * * * /usr/lib/nxsb/autoupdate.sh"
+_cron_on()  { grep -qF "$CRON_LINE" /etc/crontabs/root 2>/dev/null || { mkdir -p /etc/crontabs; [ -s /etc/crontabs/root ] && [ -n "$(tail -c1 /etc/crontabs/root)" ] && echo >> /etc/crontabs/root; echo "$CRON_LINE" >> /etc/crontabs/root; /etc/init.d/cron restart >/dev/null 2>&1; }; }
+_cron_off() { [ -f /etc/crontabs/root ] && grep -qF "$CRON_LINE" /etc/crontabs/root && { sed -i "\#/usr/lib/nxsb/autoupdate.sh#d" /etc/crontabs/root; /etc/init.d/cron restart >/dev/null 2>&1; }; }
+
+# name of the interface whose IPv4 subnet contains $1, empty if none (ipcalc.sh ships with base-files)
+_subnet_of() {
+	local addr="$1" line dev cidr net want
+	ip -4 -o addr show 2>/dev/null | while read -r line; do
+		set -- $line; dev=$2; cidr=$4
+		[ "$dev" = lo ] && continue
+		case "$cidr" in */32) continue;; esac
+		want="$(ipcalc.sh "$addr/${cidr#*/}" 2>/dev/null | sed -n 's/^NETWORK=//p')"
+		net="$(ipcalc.sh "$cidr" 2>/dev/null | sed -n 's/^NETWORK=//p')"
+		[ -n "$net" ] && [ "$net" = "$want" ] && { echo "$dev ($cidr)"; break; }
+	done
+}
+
+# Dashboard on port 80 under a fake name: a private alias address on the router, dnsmasq answers the name
+# with it, nftables redirects :80 on that address to the api port. Removed on stop.
+_dash_on() {
+	[ "$(uci -q get nxsb.main.dashboard)" != 0 ] || return 0
+	local host ip port d via
+	# upgraded installs may lack the newer options: fall back to the shipped defaults
+	host="$(uci -q get nxsb.main.dashboard_host)"; [ -n "$(uci -q get nxsb.main.dashboard_host 2>/dev/null; uci -q show nxsb.main.dashboard_host)" ] || host="dash.nxsb.arpa"
+	ip="$(uci -q get nxsb.main.dashboard_ip)"; ip="${ip:-10.255.255.254}"
+	port="$(cat $RUN/api.port 2>/dev/null)"; port="${port:-$(uci -q get nxsb.main.api_port)}"; port="${port:-9091}"
+	[ -n "$host" ] || return 0
+	command -v nft >/dev/null 2>&1 || { _event "nft not found: dashboard name disabled, use http://<router-ip>:$port/dashboard/"; return 0; }
+	# the alias must not sit inside a subnet the router already has on an interface (LAN, WAN, guest, VPN)
+	via="$(_subnet_of "$ip")"
+	[ -z "$via" ] || { _event "dashboard address $ip is inside the $via network: dashboard name disabled, change it in Settings » Advanced » Dashboard alias address or use http://<router-ip>:$port/dashboard/"; return 0; }
+	ip addr add "$ip/32" dev lo 2>$RUN/dash.err || grep -q "exists" $RUN/dash.err || { _event "WARNING could not add the dashboard address $ip: $(head -1 $RUN/dash.err); use http://<router-ip>:$port/dashboard/"; return 0; }
+	nft delete table inet nxsb 2>/dev/null
+	nft -f - 2>$RUN/nft.err <<-EOF
+		table inet nxsb {
+			chain dstnat {
+				type nat hook prerouting priority dstnat; policy accept;
+				ip daddr $ip tcp dport 80 redirect to :$port comment "nxsb dashboard"
+			}
+			chain output {
+				type nat hook output priority -100; policy accept;
+				ip daddr $ip tcp dport 80 redirect to :$port comment "nxsb dashboard (local)"
+			}
+		}
+	EOF
+	[ $? = 0 ] || { _event "WARNING dashboard port-80 redirect failed: $(head -1 $RUN/nft.err); use http://<router-ip>:$port/dashboard/"; ip addr del "$ip/32" dev lo 2>/dev/null; return 0; }
+	echo "$ip" > $RUN/dash.ip
+	for d in $(_dnsmasq_confdirs); do mkdir -p "$d"; echo "address=/$host/$ip" > "$d/nxsb-dash.conf"; done
+	[ -n "$(_dnsmasq_confdirs)" ] || _event "dnsmasq is not running: the name $host is not served, use http://<router-ip>:$port/dashboard/"
+}
+_dash_off() {
+	local ip f; ip="$(cat $RUN/dash.ip 2>/dev/null)"; ip="${ip:-$(uci -q get nxsb.main.dashboard_ip)}"
+	nft delete table inet nxsb 2>/dev/null
+	[ -n "$ip" ] && ip addr del "$ip/32" dev lo 2>/dev/null; rm -f $RUN/dash.ip
+	for f in /tmp/dnsmasq.d/nxsb-dash.conf /tmp/dnsmasq.*.d/nxsb-dash.conf; do [ -f "$f" ] && rm -f "$f" && DNS_CHANGED=1; done
+	return 0
+}
+
+# Fool-proof recovery: /etc/init.d/nxsb reset [full]
+reset() {
+	local full="$1" url was dns6 cc
+	url="$(uci -q get nxsb.main.sub_url)"; dns6="$(uci -q get nxsb.main.dns6_saved)"; cc="$(uci -q get nxsb.main.bbr_saved)"
+	/etc/init.d/nxsb running && was=1 || was=0
+	stop
+	cp -f $LIB/nxsb.defaults /etc/config/nxsb
+	rm -f $DATA/cache.db $RUN/dns.port
+	[ "$full" = full ] && rm -f $DATA/subscription.json
+	[ "$full" != full ] && [ -n "$url" ] && uci set nxsb.main.sub_url="$url"
+	[ -n "$dns6" ] && uci set nxsb.main.dns6_saved="$dns6"
+	[ -n "$cc" ] && uci set nxsb.main.bbr_saved="$cc"
+	[ "$full" = full ] && rm -f $DATA/subscription.json.prev $DATA/sub.json
+	uci commit nxsb
+	echo "settings reset to defaults$( [ "$full" = full ] && echo ', subscription and cache dropped' || echo ' (subscription URL kept, cache cleared)')"
+	if [ "$was" = 1 ] && [ "$full" != full ]; then uci set nxsb.main.enabled=1; uci commit nxsb; start && echo "service restarted"; fi
+}
+
+# Wipe everything the core wrote: /etc/nxsb (cache.db, rule-set cache, stored subscription) and the runtime dir.
+destroy() {
+	stop
+	# everything the core wrote; the service events stay (they are how a problem gets diagnosed), so does the
+	# note that kmod-tcp-bbr came from this app
+	find $DATA -mindepth 1 -maxdepth 1 ! -name events.log ! -name 'kmod-tcp-bbr.*' -exec rm -rf {} + 2>/dev/null
+	rm -rf $RUN/* 2>/dev/null
+	mkdir -p $DATA $RUN
+	echo "working directory wiped: $DATA and $RUN are empty; settings kept. Update the subscription, then start."
+}
+
+# things that make the core fail or misbehave on this particular router, said once in plain words
+_preflight() {
+	local mem other
+	mem="$(awk '/^MemTotal/ {print int($2/1024)}' /proc/meminfo 2>/dev/null)"
+	[ -n "$mem" ] && [ "$mem" -lt 128 ] && _event "WARNING only ${mem} MB RAM: the core needs about 70 MB, expect out-of-memory restarts"
+	for other in passwall passwall2 homeproxy openclash shadowsocksr ssr-plus v2raya bypass; do
+		[ -x /etc/init.d/$other ] && /etc/init.d/$other running 2>/dev/null && _event "WARNING $other is running too: two tunnel apps fight over routes and DNS, stop one of them"
+	done
+	[ -x /etc/init.d/firewall ] && ! command -v fw4 >/dev/null 2>&1 && _event "WARNING firewall is not fw4 (OpenWrt older than 22.03): LAN traffic through the tunnel may be blocked"
+	[ "$(date +%Y)" -lt 2024 ] 2>/dev/null && _event "clock not set yet (year $(date +%Y)): TLS to the nodes and the panel fails until NTP syncs, the core retries by itself"
+	return 0
+}
+
+# called from hotplug when a WAN interface comes up: the ISP resolver may only be known now
+hijack_refresh() {
+	[ "$(uci -q get nxsb.main.hijack_lan_dns)" != 0 ] || return 0
+	running || return 0
+	_dns_hijack_on
+}
+
+generate() { _generate /dev/stdout; }
+diag() { $LIB/diag.sh; }
+check() {
+	# a probe only: must not rewrite the port files a running core is using
+	NXSB_NOWRITE=1 _generate $RUN/config.check.json && _check $RUN/config.check.json && echo "config ok" && rm -f $RUN/config.check.json
+}
+
+start_service() {
+	config_load nxsb
+	local enabled hijack; config_get_bool enabled main enabled 0; config_get_bool hijack main hijack_lan_dns 1
+	# congestion control as set in Settings » Core, whether or not the service runs (also re-applied on every save)
+	$LIB/deps.sh bbr apply >/dev/null 2>&1
+	[ "$enabled" = 1 ] || return 0
+
+	[ -c /dev/net/tun ] || modprobe tun >/dev/null 2>&1
+	[ -c /dev/net/tun ] || { _event "ERROR no /dev/net/tun: install kmod-tun (Settings » Core » TUN module)"; return 1; }
+	_preflight
+	[ -d $RUN/core.lock ] || rm -f $BIN.new      # a leftover candidate, unless a core install is using it right now
+	rm -f $RUN/config.check.json
+	_generate $CONF.new || return 1
+	_check $CONF.new || return 1
+	mv -f $CONF.new $CONF
+	_event "service start: config ok ($(wc -c < $CONF) bytes), core $($LIB/core.sh version 2>/dev/null)"
+	_dash_on
+	if [ "$hijack" = 1 ]; then _dns_hijack_on; else _dns_hijack_off; fi
+	$LIB/dns6.sh apply
+	_cron_on
+
+	procd_open_instance core
+	procd_set_param command $BIN run -c $CONF -D $DATA
+	# respawn: threshold 60s, 5s between retries, give up after 5 tries (a broken core must not flap routes forever)
+	procd_set_param respawn 60 5 5
+	procd_set_param stderr 1
+	procd_set_param stdout 1
+	procd_set_param limits core="unlimited" nofile="1000000 1000000"
+	procd_set_param nice -5
+	procd_close_instance
+	# mirrors the core's selector groups to $RUN/groups.json over gRPC-Web so the page never starts the core CLI
+	procd_open_instance groups
+	procd_set_param command /usr/bin/ucode $LIB/groups-watch.uc
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+	procd_open_instance logs
+	procd_set_param command /usr/bin/ucode $LIB/groups-watch.uc logs
+	procd_set_param respawn 3600 5 0
+	procd_set_param stderr 1
+	procd_close_instance
+}
+
+stop_service() {
+	rm -f $RUN/groups.json $RUN/core.log
+	_event "service stop"
+	DNS_CHANGED=0
+	_dash_off
+	_dns_hijack_off || true
+	[ "$DNS_CHANGED" = 1 ] && _dnsmasq_restart
+	# the cron line stays (autoupdate.sh does nothing while the service is off); postrm removes it
+	rm -f $CONF $RUN/dns.port $RUN/api.port
+}
+
+reload_service() {
+	restart
+}
+
+service_triggers() {
+	procd_add_reload_trigger "nxsb"
+}

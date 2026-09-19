@@ -1,0 +1,8 @@
+{
+	"luci-app-nxsb": {
+		"description": "Grant access to the Sing-Box (nxsb) application",
+		"read": { "ubus": { "luci.nxsb": [ "status", "core_status", "core_guide", "deps_status", "deps_guide", "sub_status", "log", "diag_status" ] }, "uci": [ "nxsb" ] },
+		"write": { "ubus": { "luci.nxsb": [ "core_install", "core_import", "deps_install", "deps_import", "bbr_apply", "sub_update", "sub_import", "select", "service", "enable_start", "disable_stop", "reset_settings", "destroy_workdir", "check", "urltest", "diag" ] }, "uci": [ "nxsb" ],
+			"cgi-io": [ "upload" ], "file": { "/tmp/nxsb-core-upload.tar.gz": [ "write" ], "/tmp/nxsb-core-upload": [ "write" ], "/tmp/nxsb-kmod-upload.ipk": [ "write" ], "/tmp/nxsb-sub-upload.json": [ "write" ] } }
+	}
+}

@@ -1,0 +1,236 @@
+// nxsb rpcd backend (ubus object luci.nxsb). BusyBox-only assumptions; long jobs run detached.
+'use strict';
+
+import { popen, readfile, writefile, mkdir, stat } from 'fs';
+import { cursor } from 'uci';
+import { connect } from 'ubus';
+import { call as grpc, pb_str } from 'nxsb.grpc';
+
+const LIB = '/usr/lib/nxsb';
+const RUN = '/var/run/nxsb';
+const DATA = '/etc/nxsb';
+const SUB = `${DATA}/subscription.json`;
+
+function shq(s) { return "'" + replace(`${s}`, "'", "'\\''") + "'"; }
+function sh(cmd) { let p = popen(cmd, 'r'); if (!p) return null; let out = p.read('all'); p.close(); return out; }
+function shjson(cmd) { try { return json(sh(cmd)); } catch (e) { return null; } }
+// each job kind has one log the page tails; the core job's is separate from the core's own log mirror
+function joblog(name) { return name == 'core' ? `${RUN}/core-install.log` : `${RUN}/${name}.log`; }
+function alive(pid) { return pid > 0 && stat(`/proc/${pid}`) != null; }
+// one background job per kind. Busy = its state says running and either its recorded pid is alive, or (no pid
+// recorded: the install-time job queued by postinst) the state is younger than 20 min. Anything the job prints
+// outside its own log (a crash, a missing interpreter) lands in the log too, so a dead job leaves a trace.
+function job(name, cmd) {
+	mkdir(RUN);
+	let st = stat(`${RUN}/${name}.state`);
+	if (st && trim(readfile(`${RUN}/${name}.state`) ?? '') == 'running') {
+		let pid = +(trim(readfile(`${RUN}/${name}.pid`) ?? '') || 0);
+		if (pid ? alive(pid) : time() - st.mtime < 1200) return { error: 'already running, wait for it to finish' };
+	}
+	writefile(`${RUN}/${name}.state`, 'running'); writefile(joblog(name), '');
+	system(`( ${cmd} ) >/dev/null 2>>${joblog(name)} </dev/null & echo $! > ${RUN}/${name}.pid`);
+	return { ok: true };
+}
+// subscription state: /etc/nxsb/sub.json (written by subscribe.uc); older builds kept it in uci
+function substate(main) {
+	let j; try { j = json(readfile(`${DATA}/sub.json`)); } catch (e) { j = null; }
+	if (type(j) == 'object') return j;
+	return { source: main.sub_source ?? 'url', last_update: +(main.sub_last_update ?? 0), last_error: main.sub_last_error ?? '', nodes: +(main.sub_nodes ?? 0) };
+}
+function tail(path, n) { let s = readfile(path); if (s == null) return []; let l = split(rtrim(s), '\n'); return length(l) > n ? slice(l, -n) : l; }
+function service_state() {
+	let ub = connect();
+	let r = ub ? ub.call('service', 'list', { name: 'nxsb' }) : null;
+	let inst = r?.nxsb?.instances?.core;
+	if (inst) return { running: inst.running == true, pid: inst.pid ?? null };
+	// no procd entry (stray core, dev container): a running "nxsb run" still counts; "nxsb check"/"version" do not
+	for (let pid in split(trim(sh('pidof nxsb 2>/dev/null') ?? ''), ' ')) {
+		if (pid == '') continue;
+		let argv = split(readfile(`/proc/${pid}/cmdline`) ?? '', '\0');
+		if (argv[1] == 'run') return { running: true, pid: +pid };
+	}
+	return { running: false, pid: null };
+}
+// selector groups: live snapshot mirrored by groups-watch.uc (gRPC-Web stream -> groups.json, milliseconds to
+// read); without it (core down, watcher not up yet) the stored subscription's defaults
+function groups(live) {
+	if (live) {
+		let j; try { j = json(readfile(`${RUN}/groups.json`)); } catch (e) { j = null; }
+		if (type(j?.groups) == 'array' && length(j.groups)) return j.groups;
+	}
+	let out = [];
+	let cfg; try { cfg = json(readfile(SUB)); } catch (e) { cfg = null; }
+	for (let ob in (cfg?.outbounds || []))
+		if (ob.type == 'selector' || ob.type == 'urltest') push(out, { tag: ob.tag, type: ob.type, now: ob.default ?? null, all: ob.outbounds, delay: null });
+	return out;
+}
+
+const methods = {
+	status: {
+		call: function() {
+			let uci = cursor();
+			let main = uci.get_all('nxsb', 'main') || {};
+			let core = shjson(`${LIB}/core.sh status 2>/dev/null`) || { installed: false };
+			let svc = service_state();
+			let sub = stat(SUB), ss = substate(main);
+			return {
+				enabled: main.enabled == '1',
+				service: svc,
+				core,
+				subscription: { configured: match(main.sub_url ?? '', /^https?:\/\//) != null, stored: sub != null, bytes: sub ? sub.size : 0, source: ss.source ?? 'url',
+					last_update: +(ss.last_update ?? 0), last_error: ss.last_error ?? '', nodes: +(ss.nodes ?? 0) },
+				groups: groups(svc.running),
+				core_task: trim(readfile(`${RUN}/core.state`) ?? ''),
+				sub_task: trim(readfile(`${RUN}/sub.state`) ?? ''),
+				app_version: trim(readfile(`${LIB}/VERSION`) ?? ''),
+				deps: shjson(`${LIB}/deps.sh status 2>/dev/null`) || {},
+				dashboard: { enabled: (main.dashboard ?? '1') == '1', port: +(trim(readfile(`${RUN}/api.port`) ?? '') || (main.api_port ?? 9091)), host: main.dashboard_host ?? '', ip: main.dashboard_ip ?? '', secret: main.api_secret ?? '',
+					// name + alias only work when the service could set them up (nft present, address outside the LAN)
+					active: stat(`${RUN}/dash.ip`) != null,
+					lan_ip: trim(sh('uci -q get network.lan.ipaddr') ?? '') },
+			};
+		}
+	},
+
+	core_install: {
+		args: { version: 'version', sha256: 'sha256' },
+		call: function(req) {
+			let v = req.args?.version ?? '', sha = req.args?.sha256 ?? '';
+			if (v != '' && !match(v, /^[0-9][0-9A-Za-z.\-]*$/)) return { error: 'bad version' };
+			if (sha != '' && !match(sha, /^[0-9a-f]{64}$/)) return { error: 'bad sha256' };
+			return job('core', v == '' ? `${LIB}/core.sh install` : `${LIB}/core.sh upgrade ${shq(v)} ${sha != '' ? shq(sha) : ''}`);
+		}
+	},
+	deps_install: {
+		args: { what: 'what' },
+		call: function(req) { let w = req.args?.what ?? 'tun'; if (index(['tun', 'bbr', 'all'], w) < 0) return { error: 'bad module' }; return job('deps', `${LIB}/deps.sh kmod ${w}`); }
+	},
+	deps_guide: {
+		args: { what: 'what' },
+		call: function(req) { let w = req.args?.what ?? 'tun'; if (index(['tun', 'bbr'], w) < 0) return { error: 'bad module' }; return shjson(`${LIB}/deps.sh guide ${w} 2>/dev/null`) || { error: 'guide failed' }; }
+	},
+	deps_import: {
+		args: { path: 'path' },
+		call: function(req) {
+			let p = req.args?.path ?? '';
+			if (p != '/tmp/nxsb-kmod-upload.ipk') return { error: 'bad path' };
+			return job('deps', `${LIB}/deps.sh import ${shq(p)}; rm -f /tmp/nxsb-kmod-upload.ipk`);
+		}
+	},
+	// applies the congestion control setting right now (module must be on disk); returns the module state
+	bbr_apply: {
+		call: function() {
+			// deps.sh logs with a timestamp prefix; the page wants the sentence only
+			let out = join('; ', filter(map(split(trim(sh(`${LIB}/deps.sh bbr apply 2>&1`) ?? ''), '\n'), l => replace(l, /^[0-9-]+ [0-9:]+ /, '')), l => l != ''));
+			let deps = shjson(`${LIB}/deps.sh status 2>/dev/null`) || {};
+			let why = !deps.bbr_wanted ? 'BBR is turned off in Settings » Core' : !deps.bbr_installed ? 'the BBR module is not installed' : (out || 'the module did not load; reboot the router and try again');
+			return { ok: deps.bbr_active == true, reason: deps.bbr_active ? '' : why, output: out, deps };
+		}
+	},
+	deps_status: { call: function() { return { state: trim(readfile(`${RUN}/deps.state`) ?? ''), log: tail(`${RUN}/deps.log`, 40) }; } },
+	core_guide: { call: function() { return shjson(`${LIB}/core.sh guide 2>/dev/null`) || { error: 'guide failed' }; } },
+	core_import: {
+		args: { path: 'path' },
+		call: function(req) {
+			let p = req.args?.path ?? '';
+			if (!match(p, /^\/tmp\/nxsb-core-upload(\.tar\.gz)?$/)) return { error: 'bad path' };
+			return job('core', `${LIB}/core.sh import ${shq(p)}; rm -f /tmp/nxsb-core-upload /tmp/nxsb-core-upload.tar.gz`);
+		}
+	},
+	core_status: { call: function() { return { state: trim(readfile(`${RUN}/core.state`) ?? ''), log: tail(joblog('core'), 40), core: shjson(`${LIB}/core.sh status 2>/dev/null`) }; } },
+
+	sub_update: {
+		call: function() {
+			return job('sub', `ucode ${LIB}/subscribe.uc`);
+		}
+	},
+	sub_import: {
+		args: { path: 'path' },
+		call: function(req) {
+			let p = req.args?.path ?? '';
+			if (p != '/tmp/nxsb-sub-upload.json') return { error: 'bad path' };
+			return job('sub', `ucode ${LIB}/subscribe.uc import ${shq(p)}; rm -f ${shq(p)}`);
+		}
+	},
+	sub_status: { call: function() { return { state: trim(readfile(`${RUN}/sub.state`) ?? ''), log: tail(`${RUN}/sub.log`, 40) }; } },
+
+	select: {
+		args: { group: 'group', tag: 'tag' },
+		call: function(req) {
+			let g = req.args?.group ?? '', tag = req.args?.tag ?? '';
+			if (g == '' || tag == '' || length(g) > 200 || length(tag) > 200) return { error: 'bad args' };
+			let svc = service_state();
+			if (!svc.running) return { error: 'core is not running' };
+			// a refused selection comes back as an empty reply, so check membership here
+			let grp = filter(groups(true), x => x.tag == g)[0];
+			if (!grp) return { error: `no group ${g}` };
+			if (grp.type != 'selector') return { error: `${g} is not a selector` };
+			if (index(grp.all, tag) < 0) return { error: `${tag} is not in ${g}` };
+			let r = grpc('SelectOutbound', pb_str(1, g) + pb_str(2, tag));
+			return r.ok ? { ok: true } : { error: r.message };
+		}
+	},
+
+	// the test is only spawned; results appear in the group snapshot a few seconds later
+	urltest: {
+		args: { group: 'group' },
+		call: function(req) {
+			let g = req.args?.group ?? '';
+			if (g == '' || length(g) > 200) return { error: 'bad group' };
+			if (!service_state().running) return { error: 'core is not running' };
+			if (!filter(groups(true), x => x.tag == g)[0]) return { error: `no group ${g}` };
+			let r = grpc('URLTest', pb_str(1, g));
+			return r.ok ? { ok: true } : { error: r.message };
+		}
+	},
+
+	service: {
+		args: { action: 'action' },
+		call: function(req) {
+			let a = req.args?.action ?? '';
+			if (index(['start', 'stop', 'restart', 'reload', 'enable', 'disable'], a) < 0) return { error: 'bad action' };
+			// start = generate + core check + dnsmasq restart, synchronous; a long sleep here could push a slow router
+			// past the page's 20 s rpc timeout, so only a short settle before reporting the state
+			let out = sh(`/etc/init.d/nxsb ${a} 2>&1`);
+			if (a == 'start' || a == 'restart' || a == 'reload') system('sleep 1');
+			return { ok: true, output: out, service: service_state() };
+		}
+	},
+	enable_start: { call: function() { let out = sh(`uci set nxsb.main.enabled=1; uci commit nxsb; /etc/init.d/nxsb enable; /etc/init.d/nxsb start 2>&1`); system('sleep 1'); return { ok: true, output: out, service: service_state() }; } },
+	disable_stop: { call: function() { return { ok: true, output: sh(`/etc/init.d/nxsb stop 2>&1; uci set nxsb.main.enabled=0; uci commit nxsb`) }; } },
+	reset_settings: {
+		args: { full: false },
+		call: function(req) { return { ok: true, output: sh(`/etc/init.d/nxsb reset ${req.args?.full ? 'full' : ''} 2>&1`) }; }
+	},
+	destroy_workdir: { call: function() { return { ok: true, output: sh(`/etc/init.d/nxsb destroy 2>&1`) }; } },
+	// the reason for a failed check is in the core's output and the generator's stderr, not on stdout
+	check: { call: function() { return { output: sh(`/etc/init.d/nxsb check 2>&1; rc=$?; [ $rc = 0 ] || { cat ${RUN}/generate.err ${RUN}/check.out 2>/dev/null | sed "s/$(printf '\\033')\\[[0-9;]*m//g"; }; echo "rc=$rc"`) }; } },
+	diag: { call: function() { return job('diag', `${LIB}/diag.sh > ${RUN}/diag.log 2>&1; echo done > ${RUN}/diag.state`); } },
+	diag_status: { call: function() { return { state: trim(readfile(`${RUN}/diag.state`) ?? ''), report: readfile(`${RUN}/diag.log`) ?? '' }; } },
+	log: {
+		args: { lines: 200, all: false },
+		call: function(req) {
+			let n = +(req.args?.lines ?? 200); if (n < 10 || n > 2000) n = 200;
+			// service events (our own file) + the core log mirrored by groups-watch.uc logs (file, no core process):
+			// warnings and up by default, daemon-level info with all=true; per-connection and health-check lines never
+			let events = sh(`tail -n ${n} ${DATA}/events.log 2>/dev/null`) ?? '';
+			let keep = req.args?.all ? /^(PANIC|FATAL|ERROR|WARN|INFO) / : /^(PANIC|FATAL|ERROR|WARN) /;
+			let core = [];
+			for (let l in split(readfile(`${RUN}/core.log`) ?? '', '\n')) {
+				if (!match(l, keep)) continue;
+				if (match(l, /^INFO \[[0-9]+ /) || match(l, /^INFO outbound\/[a-z]+\[[^\]]*\]: outbound connection to /) || match(l, /: server error 101: Remote EOF/) != null) continue;
+				push(core, l);
+			}
+			if (length(core) > n) core = slice(core, -n);
+			let out = (length(events) ? '--- service events ---\n' + events : '') + (length(core) ? '--- core ---\n' + join('\n', core) + '\n' : '');
+			// the three job logs: what a failed core download, module install or subscription fetch said
+			for (let j in [ [ 'core install', 'core', joblog('core') ], [ 'modules', 'deps', joblog('deps') ], [ 'subscription', 'sub', joblog('sub') ] ]) {
+				let t = tail(j[2], 12); if (!length(t)) continue;
+				out += `--- ${j[0]} (${trim(readfile(`${RUN}/${j[1]}.state`) ?? '') || 'idle'}) ---\n` + join('\n', t) + '\n';
+			}
+			return { log: out };
+		}
+	},
+};
+
+return { 'luci.nxsb': methods };

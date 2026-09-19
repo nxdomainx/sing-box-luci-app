@@ -1,0 +1,83 @@
+#!/bin/sh
+[ "${IPKG_NO_SCRIPT}" = "1" ] && exit 0
+[ -s ${IPKG_INSTROOT}/lib/functions.sh ] || exit 0
+
+# reclaim a core parked by the previous package's postrm (reinstall / upgrade) BEFORE anything starts
+if [ -z "${IPKG_INSTROOT}" ] && [ ! -x /usr/bin/nxsb ] && [ -x /usr/bin/.nxsb-core.keep ]; then
+	mv -f /usr/bin/.nxsb-core.keep /usr/bin/nxsb
+fi
+
+# the congestion control in use before this package touches it (the service start below may switch it); put back on removal
+[ -n "${IPKG_INSTROOT}" ] || [ -n "$(uci -q get nxsb.main.bbr_saved)" ] || { uci set nxsb.main.bbr_saved="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null)"; uci commit nxsb; }
+
+. ${IPKG_INSTROOT}/lib/functions.sh
+default_postinst $0 $@
+
+[ -n "${IPKG_INSTROOT}" ] && exit 0
+
+/etc/init.d/rpcd reload >/dev/null 2>&1
+fw4 reload >/dev/null 2>&1
+rm -f /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null
+
+# opkg's copy of the shipped config on upgrade: settings live in the existing file, new options have defaults in code
+rm -f /etc/config/nxsb-opkg
+# a removal's boot-time cleanup fallback is moot once the package is back
+rm -f /etc/uci-defaults/zz-nxsb-cleanup
+# subscription state used to live in uci; it is a file now (never committed by a background job)
+if [ -n "$(uci -q get nxsb.main.sub_nodes)$(uci -q get nxsb.main.sub_last_update)" ]; then
+	mkdir -p /etc/nxsb
+	[ -s /etc/nxsb/sub.json ] || printf '{ "source": "%s", "last_update": %s, "last_error": "%s", "nodes": %s }\n' \
+		"$(uci -q get nxsb.main.sub_source | grep . || echo url)" "$(uci -q get nxsb.main.sub_last_update | grep . || echo 0)" \
+		"$(uci -q get nxsb.main.sub_last_error | sed 's/["\\]/./g')" "$(uci -q get nxsb.main.sub_nodes | grep . || echo 0)" > /etc/nxsb/sub.json
+	for k in sub_source sub_last_update sub_last_error sub_nodes; do uci -q delete nxsb.main.$k; done; uci commit nxsb
+fi
+# options earlier builds wrote that nothing reads any more
+for k in clash_api_port clash_api_secret; do uci -q delete nxsb.main.$k; done; uci commit nxsb
+
+missing=""
+if /usr/lib/nxsb/deps.sh status 2>/dev/null | grep -q '"tun":true'; then
+	echo "nxsb: tun module installed"
+else
+	missing="kmod-tun"
+fi
+if [ "$(uci -q get nxsb.main.bbr)" != 0 ]; then
+	if ls /lib/modules/*/tcp_bbr.ko >/dev/null 2>&1 || grep -q tcp_bbr /lib/modules/$(uname -r)/modules.builtin 2>/dev/null; then
+		/usr/lib/nxsb/deps.sh bbr apply >/dev/null 2>&1 && echo "nxsb: BBR congestion control active"
+	else
+		missing="$missing${missing:+ }kmod-tcp-bbr"
+	fi
+fi
+if [ -z "$missing" ]; then
+	:
+elif [ "${NXSB_SKIP_CORE}" = "1" ]; then
+	echo "nxsb: $missing missing, not installed (NXSB_SKIP_CORE=1). LuCI » Services » Sing-Box » Settings » Core"
+else
+	# opkg holds its lock while we run, so the feed install is queued to start right after this install finishes
+	/usr/lib/nxsb/deps.sh kmod-deferred
+	echo "nxsb: $missing missing; fetched from the OpenWrt feed as soon as this opkg run ends (about a minute)."
+	echo "      Progress and result: LuCI » Services » Sing-Box. If that fails (no internet), install offline:"
+	for m in $missing; do
+		echo "      download $(/usr/lib/nxsb/deps.sh guide $m | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')"
+	done
+	echo "      and upload in LuCI » Sing-Box » Settings » Core, or: /usr/lib/nxsb/deps.sh import /tmp/<file>.ipk"
+fi
+
+# IPv6 DNS advertisement off from now on (Settings » LAN to turn it back on); see dns6.sh for why
+/usr/lib/nxsb/dns6.sh apply >/dev/null 2>&1
+
+if [ -x /usr/bin/nxsb ] && [ -n "$(/usr/lib/nxsb/core.sh version 2>/dev/null)" ]; then
+	echo "nxsb: core already installed (sing-box $(/usr/lib/nxsb/core.sh version 2>/dev/null))"
+elif [ -x /usr/bin/nxsb ]; then
+	echo "nxsb: a core binary is present but does not run on this box (exit code $(/usr/bin/nxsb version >/dev/null 2>&1; echo $?)); replace it from LuCI » Services » Sing-Box » Settings » Core"
+elif [ "${NXSB_SKIP_CORE}" = "1" ]; then
+	echo "nxsb: NXSB_SKIP_CORE=1, core not fetched. Install it later from LuCI or: /usr/lib/nxsb/core.sh install"
+else
+	echo "nxsb: fetching the core for this box (set NXSB_SKIP_CORE=1 to skip, NXSB_MIRROR=<url> for a mirror)…"
+	if /usr/lib/nxsb/core.sh install; then
+		echo "nxsb: core ready. Open LuCI » Services » Sing-Box."
+	else
+		echo "nxsb: core download failed; the app is installed. Retry from LuCI » Services » Sing-Box » Install core,"
+		echo "      or offline: /usr/lib/nxsb/core.sh import /tmp/sing-box-<ver>-linux-<arch>.tar.gz"
+	fi
+fi
+exit 0

@@ -1,0 +1,6 @@
+{
+	"admin/services/nxsb": { "title": "Sing-Box", "order": 30, "action": { "type": "firstchild" }, "depends": { "acl": [ "luci-app-nxsb" ], "uci": { "nxsb": true } } },
+	"admin/services/nxsb/overview": { "title": "Overview", "order": 10, "action": { "type": "view", "path": "nxsb/overview" } },
+	"admin/services/nxsb/settings": { "title": "Settings", "order": 30, "action": { "type": "view", "path": "nxsb/settings" } },
+	"admin/services/nxsb/log": { "title": "Log", "order": 50, "action": { "type": "view", "path": "nxsb/log" } }
+}

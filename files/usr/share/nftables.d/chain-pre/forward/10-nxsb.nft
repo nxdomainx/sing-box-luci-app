@@ -1,0 +1,3 @@
+# nxsb: fw4 puts the tunnel interface in no zone, so forwarded LAN traffic into it would hit handle_reject.
+oifname "nxsb0" accept comment "nxsb: LAN -> tunnel"
+iifname "nxsb0" accept comment "nxsb: tunnel -> LAN"

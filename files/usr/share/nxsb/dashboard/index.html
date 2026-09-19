@@ -1,0 +1,27 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>sing-box dashboard</title>
+<script>
+// nxsb: land straight in the dashboard. Pre-seeds the app's own server list (same origin) with this
+// router; an optional secret can be passed in the fragment (#s=...). Then loads the unmodified app.
+(function () {
+  var m = /(?:^|[#&])s=([^&]*)/.exec(location.hash);
+  var secret = m ? decodeURIComponent(m[1]) : "";
+  var id = "nxsb-router";
+  try {
+    var key = "sing-box-dashboard.servers";
+    var cur = JSON.parse(localStorage.getItem(key) || "null") || { servers: [], activeId: null };
+    // one entry for this router: drop any other entry that points at the same host (e.g. one typed by hand)
+    var host = location.host, mine = null, keep = [];
+    for (var i = 0; i < (cur.servers || []).length; i++) {
+      var sv = cur.servers[i], u = String(sv.url || "").replace(/^https?:\/\//, "").replace(/\/+$/, "");
+      if (sv.id === id) mine = sv; else if (u !== host) keep.push(sv);
+    }
+    if (!mine) mine = { id: id, name: "Router", url: host, secret: secret };
+    mine.name = "Router"; mine.url = host; if (m) mine.secret = secret;
+    cur.servers = [mine].concat(keep); cur.activeId = id;
+    localStorage.setItem(key, JSON.stringify(cur));
+  } catch (e) {}
+  location.replace("app.html" + (location.hash && !m ? location.hash : ""));
+})();
+</script>

@@ -1,0 +1,11 @@
+Package: nxdomainx-luci-app-sing-box
+Version: @VERSION@
+Depends: libc, luci-base, rpcd, rpcd-mod-ucode, ucode, ucode-mod-fs, ucode-mod-uci, ucode-mod-ubus, uclient-fetch, ca-bundle
+Provides: luci-app-nxsb
+Section: luci
+Priority: optional
+Architecture: all
+Installed-Size: @SIZE@
+Maintainer: nxdomainx
+Description: LuCI app for a sing-box transparent proxy (TUN) on OpenWrt.
+ Ships no core binary; the matching upstream sing-box release is fetched, verified and installed as /usr/bin/nxsb at install time or from the UI.

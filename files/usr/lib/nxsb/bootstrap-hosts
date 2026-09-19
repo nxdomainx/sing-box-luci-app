@@ -1,0 +1,15 @@
+# nxsb pinned bootstrap addresses. The ISP poisons these names; the IP+SNI path is open, but not every anycast
+# edge answers from every network, so several candidates per host are tried in order (see deps.sh unpoison_on).
+167.82.2.132 downloads.openwrt.org
+146.75.122.132 downloads.openwrt.org
+151.101.66.132 downloads.openwrt.org
+151.101.130.132 downloads.openwrt.org
+140.82.121.4 github.com
+140.82.121.3 github.com
+185.199.110.133 objects.githubusercontent.com
+185.199.111.133 objects.githubusercontent.com
+185.199.108.133 objects.githubusercontent.com
+185.199.111.133 release-assets.githubusercontent.com
+185.199.108.133 release-assets.githubusercontent.com
+185.199.110.133 raw.githubusercontent.com
+185.199.111.133 raw.githubusercontent.com
