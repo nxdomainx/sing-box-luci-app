@@ -70,7 +70,8 @@ return view.extend({
 		o = s.taboption('advanced', form.ListValue, 'tun_stack', _('TUN stack'), _('system is fastest. Try gvisor only if something breaks.'));
 		o.value('system'); o.value('gvisor'); o.value('mixed'); o.default = 'system';
 		o = s.taboption('advanced', form.Value, 'tun_mtu', _('TUN MTU'), _('Empty = 1500.')); o.datatype = 'range(1280,65535)'; o.placeholder = '1500';
-		o = s.taboption('advanced', form.Flag, 'auto_redirect', _('nftables auto-redirect'), _('nftables redirect for LAN traffic. Leave off unless you know why.'));
+		o = s.taboption('advanced', form.Flag, 'auto_redirect', _('nftables auto-redirect'), _('Recommended. Leave on unless you know what you are doing.'));
+		o.default = '1';
 		o = s.taboption('advanced', form.DynamicList, 'tun_exclude', _('Keep out of the tunnel'), _('Destinations that never enter the TUN, as IP or CIDR.'));
 		o.datatype = 'or(ipaddr,cidr4,cidr6)'; o.placeholder = _('add an IP or CIDR');
 		o = s.taboption('general', form.Flag, 'dashboard', _('Web dashboard'), _('Web dashboard on the LAN.')); o.default = '1';

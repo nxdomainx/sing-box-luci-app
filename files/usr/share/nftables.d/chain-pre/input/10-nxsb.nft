@@ -1,2 +1,0 @@
-# nxsb: packets the tunnel hands back to the router itself
-iifname "nxsb0" accept comment "nxsb: tunnel -> router"
