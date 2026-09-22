@@ -134,7 +134,11 @@ return view.extend({
 					if (common.busy(r, callSubStatus, _('Subscription job already running'), function() { self.refresh(0); })) return;
 					if (r && r.error) return common.warn(r.error);
 					common.taskModal(_('Updating subscription'), _('Fetching the config from the panel.'), callSubStatus, function(state, last) {
-						if (state == 'done' && running) common.info(_('Restart to apply the new subscription.'));
+						if (state == 'done' && running) {
+							/* the core rereads its config on SIGHUP, so applying it costs no outage */
+							callService('reload_core').then(function() { common.info(_('Applied.')); self.refresh(500); })
+								.catch(function() { common.warn(_('Fetched, but could not be applied. Restart to apply it.')); });
+						}
 						else if (state == 'failed') common.warn(_('Subscription update failed: %s').format(last || _('see the Log page')));
 						self.refresh(0);
 					});

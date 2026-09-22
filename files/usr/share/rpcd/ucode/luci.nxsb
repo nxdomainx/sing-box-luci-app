@@ -188,11 +188,11 @@ const methods = {
 		args: { action: 'action' },
 		call: function(req) {
 			let a = req.args?.action ?? '';
-			if (index(['start', 'stop', 'restart', 'reload', 'enable', 'disable'], a) < 0) return { error: 'bad action' };
+			if (index(['start', 'stop', 'restart', 'reload', 'reload_core', 'enable', 'disable'], a) < 0) return { error: 'bad action' };
 			// start = generate + core check + dnsmasq restart, synchronous; a long sleep here could push a slow router
 			// past the page's 20 s rpc timeout, so only a short settle before reporting the state
 			let out = sh(`/etc/init.d/nxsb ${a} 2>&1`);
-			if (a == 'start' || a == 'restart' || a == 'reload') system('sleep 1');
+			if (a == 'start' || a == 'restart' || a == 'reload' || a == 'reload_core') system('sleep 1');
 			return { ok: true, output: out, service: service_state() };
 		}
 	},

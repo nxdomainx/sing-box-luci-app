@@ -5,7 +5,7 @@
 //   groups-watch.uc logs     SubscribeLog    -> /var/run/nxsb/core.log (last 500 lines, "LEVEL message")
 // A refused stream (wrong secret, api service off) is an EMPTY reply, not an error frame: three empty replies in
 // a row are reported once (syslog + service events) and the retry slows down until the stream delivers again.
-import { popen, writefile, rename, unlink, open } from 'fs';
+import { popen, writefile, rename, unlink, open, readfile } from 'fs';
 import { frame, fetch_cmd, fetch_reason, endpoint, decode_groups, pb_decode } from 'nxsb.grpc';
 
 const RUN = '/var/run/nxsb';
@@ -13,10 +13,19 @@ const MODE = ARGV[0] == 'logs' ? 'logs' : 'groups';
 const OUT = MODE == 'logs' ? `${RUN}/core.log` : `${RUN}/groups.json`;
 const REQ = `${RUN}/${MODE}.req.bin`;
 const ERR = `${RUN}/${MODE}.err`;
+// uclient-fetch is a grandchild (popen runs it under a shell) and holds a 24h timeout, so procd killing
+// us leaves it behind to sit on the api socket until it expires. Its pid is recorded so it can be put
+// down: on the way out, and again at startup for the one a previous run could not reap.
+const PIDF = `${RUN}/${MODE}.fetch.pid`;
 const LEVEL = [ 'PANIC', 'FATAL', 'ERROR', 'WARN', 'INFO', 'DEBUG', 'TRACE' ];
 let lines = [], empties = 0, noted = false;
 
 function shq(s) { return "'" + replace(`${s}`, "'", "'\\''") + "'"; }
+function kill_fetch() {
+	let pid = +trim(readfile(PIDF) ?? '');
+	if (pid > 1) system(`kill ${pid} 2>/dev/null`);
+	unlink(PIDF);
+}
 function stamp() { let t = localtime(); return sprintf('%04d-%02d-%02d %02d:%02d:%02d', t.year, t.mon, t.mday, t.hour, t.min, t.sec); }
 // syslog + the service events file the Log page and the diagnostics show
 function note(m) {
@@ -43,9 +52,14 @@ function handle(m) {
 }
 
 unlink(OUT);                                                          // never serve last run's snapshot
+kill_fetch();                                                         // an orphan from the previous run
+// best effort: a handler only runs when the interpreter is between instructions, so a kill while we sit
+// in read() still relies on the sweep above. It catches the common case of a stop between requests.
+try { signal('SIGTERM', () => { kill_fetch(); exit(0); }); signal('SIGINT', () => { kill_fetch(); exit(0); }); } catch (e) {}
 writefile(REQ, frame(''));
 while (true) {
-	let p = popen(fetch_cmd(MODE == 'logs' ? 'SubscribeLog' : 'SubscribeGroups', REQ, 86400, ERR), 'r');
+	// the shell execs into the fetch, so the pid it records stays valid for the process we must kill
+	let p = popen(`echo $$ > ${shq(PIDF)}; exec ` + fetch_cmd(MODE == 'logs' ? 'SubscribeLog' : 'SubscribeGroups', REQ, 86400, ERR), 'r');
 	let frames = 0, refused = null, rc = -1;
 	if (p) {
 		while (true) {
@@ -64,6 +78,7 @@ while (true) {
 		}
 		rc = p.close();
 	}
+	kill_fetch();                                                     // it may outlive the pipe we just closed
 	if (MODE == 'groups') unlink(OUT);
 	if (frames > 0 && refused == null) {
 		if (noted) { note(`${MODE} stream to the core api is back`); noted = false; }

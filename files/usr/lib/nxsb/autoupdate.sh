@@ -31,19 +31,48 @@ H="$(uci -q get nxsb.main.auto_update)"; [ "${H:-0}" -gt 0 ] 2>/dev/null || exit
 LAST="$(_ss last_update)"; LAST="${LAST:-0}"
 [ $((NOW - LAST)) -ge $((H * 3600)) ] 2>/dev/null || exit 0
 SUB=/etc/nxsb/subscription.json
-OLD="$(sha256sum $SUB 2>/dev/null | awk '{print $1}')"
-ucode /usr/lib/nxsb/subscribe.uc >/dev/null 2>&1 || { _ev "auto-update: fetch failed ($(tail -1 /var/run/nxsb/sub.log 2>/dev/null))"; exit 1; }
-NEW="$(sha256sum $SUB 2>/dev/null | awk '{print $1}')"
-if [ "$OLD" != "$NEW" ]; then
-	# the running core keeps running until the new config is known to be good; otherwise the previous one comes back
+APPLIED=/var/run/nxsb/subscription.applied.json
+BASE=/var/run/nxsb/sub.base.json
+# what the running core was generated from. Missing after an upgrade of this app (or if /var/run was cleared):
+# the stored file is then the best baseline we have, and the core is running it anyway.
+[ -s "$APPLIED" ] || cp -f $SUB "$APPLIED" 2>/dev/null
+cp -f "$APPLIED" "$BASE" 2>/dev/null
+ucode /usr/lib/nxsb/subscribe.uc >/dev/null 2>&1 || { _ev "auto-update: fetch failed ($(tail -1 /var/run/nxsb/sub.log 2>/dev/null))"; rm -f "$BASE"; exit 1; }
+# the panel re-renders on every request, so the bytes almost always differ: ask what actually moved
+V="$(ucode /usr/lib/nxsb/subdiff.uc "$BASE" "$SUB" 2>/dev/null)"
+rm -f "$BASE"
+V="${V:-restart could not compare against the running configuration}"
+WHY="${V#* }"
+case "$V" in
+same*)
+	logger -t nxsb "auto-update: no change (re-render only)"
+	;;
+*)
+	# validate before adopting it, deferred or not: a config the core rejects must never be left on disk
+	# waiting to be picked up by the next reboot
 	if /etc/init.d/nxsb check >/dev/null 2>&1; then
-		_ev "auto-update: subscription changed"
-		/etc/init.d/nxsb running && /etc/init.d/nxsb restart
+		case "$V" in
+		restart*)
+			_ev "auto-update: $WHY"
+			rm -f /var/run/nxsb/sub.deferred
+			# in place: the core rereads its configuration on SIGHUP, so this costs no outage
+			/etc/init.d/nxsb running && /etc/init.d/nxsb reload_core
+			;;
+		*)
+			# nothing in use is affected: keep the core running and let the next restart pick it up.
+			# Said once - this repeats every couple of hours and the event log is short.
+			if [ "$(cat /var/run/nxsb/sub.deferred 2>/dev/null)" != "$WHY" ]; then
+				_ev "auto-update: $WHY; stored, applies on the next restart"
+				echo "$WHY" > /var/run/nxsb/sub.deferred
+			else
+				logger -t nxsb "auto-update: $WHY; still deferred"
+			fi
+			;;
+		esac
 	else
 		_ev "auto-update: new subscription rejected by the core, kept the previous one: $(tail -1 /var/run/nxsb/check.out 2>/dev/null | sed "s/$(printf '\033')\[[0-9;]*m//g" | cut -c1-160)"
 		[ -s $SUB.prev ] && mv -f $SUB.prev $SUB
 		exit 1
 	fi
-else
-	logger -t nxsb "auto-update: no change"
-fi
+	;;
+esac

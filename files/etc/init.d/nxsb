@@ -48,6 +48,7 @@ extra_command "destroy" "Stop and wipe the core working directory (subscription,
 extra_command "generate" "Print the generated configuration"
 extra_command "hijack_refresh" "Rewrite the dnsmasq drop-in if the ISP resolver changed (hotplug)"
 extra_command "diag" "Run the diagnostics (same as the Log page button)"
+extra_command "reload_core" "Apply a new configuration to the running core without stopping it"
 
 # DNS listener port: Settings value, or the next free loopback port if something else already holds it
 _dns_port() {
@@ -87,6 +88,13 @@ _check() {
 		_event "ERROR config check failed: $(head -3 $RUN/check.out | sed "s/$(printf '\033')\[[0-9;]*m//g")"
 		return 1
 	}
+}
+
+# the subscription this core is now running: the auto-update compares against it instead of against the
+# last fetch, so a change it chose not to interrupt for stays pending rather than being forgotten
+_record_applied() {
+	cp -f $DATA/subscription.json $RUN/subscription.applied.json 2>/dev/null
+	rm -f $RUN/sub.deferred
 }
 
 # LAN DNS: dnsmasq asks the core first (loopback listener); if the core is down the query fails
@@ -238,6 +246,36 @@ check() {
 	NXSB_NOWRITE=1 _generate $RUN/config.check.json && _check $RUN/config.check.json && echo "config ok" && rm -f $RUN/config.check.json
 }
 
+# Apply a new configuration without an outage. The core rebuilds its instance on SIGHUP, in process and
+# in about 20 ms on this hardware, so none of what makes a restart slow is needed: procd does not tear the
+# instance down, the LAN DNS drop-in and the dashboard redirect still point at the same ports so dnsmasq is
+# not bounced, and the group/log watchers keep their streams (they reconnect on their own).
+# The listener ports cannot move underneath us here: while a core is running _dns_port and _api_port return
+# the ports recorded in $RUN, and a Settings change that moves them goes through reload_service -> restart.
+reload_core() {
+	local pid
+	pid="$(pgrep -f "$BIN run -c $CONF" | head -1)"
+	[ -n "$pid" ] || { start; return; }              # nothing to reload into
+	_generate $CONF.new || return 1
+	_check $CONF.new || return 1
+	mv -f $CONF.new $CONF
+	if ! kill -HUP "$pid" 2>/dev/null; then
+		_event "reload: could not signal the core (pid $pid), restarting instead"
+		restart
+		return
+	fi
+	# a config the core accepted in check should never fail here, but if it does the core exits and procd
+	# respawns it: say so rather than reporting a reload that did not happen
+	sleep 1
+	if kill -0 "$pid" 2>/dev/null; then
+		_record_applied
+		_event "config reloaded in place ($(wc -c < $CONF) bytes), core kept running"
+	else
+		_event "ERROR the core did not survive the reload; procd is bringing it back"
+		return 1
+	fi
+}
+
 start_service() {
 	config_load nxsb
 	local enabled hijack; config_get_bool enabled main enabled 0; config_get_bool hijack main hijack_lan_dns 1
@@ -253,6 +291,7 @@ start_service() {
 	_generate $CONF.new || return 1
 	_check $CONF.new || return 1
 	mv -f $CONF.new $CONF
+	_record_applied
 	_event "service start: config ok ($(wc -c < $CONF) bytes), core $($LIB/core.sh version 2>/dev/null)"
 	_dash_on
 	if [ "$hijack" = 1 ]; then _dns_hijack_on; else _dns_hijack_off; fi
