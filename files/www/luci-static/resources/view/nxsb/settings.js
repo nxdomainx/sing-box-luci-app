@@ -71,6 +71,8 @@ return view.extend({
 		o.value('system'); o.value('gvisor'); o.value('mixed'); o.default = 'system';
 		o = s.taboption('advanced', form.Value, 'tun_mtu', _('TUN MTU'), _('Empty = 1500.')); o.datatype = 'range(1280,65535)'; o.placeholder = '1500';
 		o = s.taboption('advanced', form.Flag, 'auto_redirect', _('nftables auto-redirect'), _('nftables redirect for LAN traffic. Leave off unless you know why.'));
+		o = s.taboption('advanced', form.DynamicList, 'tun_exclude', _('Keep out of the tunnel'), _('Destinations that never enter the TUN, as IP or CIDR.'));
+		o.datatype = 'or(ipaddr,cidr4,cidr6)'; o.placeholder = _('add an IP or CIDR');
 		o = s.taboption('general', form.Flag, 'dashboard', _('Web dashboard'), _('Web dashboard on the LAN.')); o.default = '1';
 		o = s.taboption('general', form.Value, 'dashboard_host', _('Dashboard name'), _('Local name for the dashboard, port 80. The router address with the dashboard port works as well.')); o.default = 'dash.nxsb.arpa'; o.depends('dashboard', '1');
 		o.datatype = 'hostname';

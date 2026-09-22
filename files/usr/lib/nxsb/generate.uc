@@ -48,6 +48,15 @@ tun.stack = str(main.tun_stack, 'system');
 tun.mtu = str(main.tun_mtu, '') != '' ? +main.tun_mtu : 1500;
 delete tun.auto_redirect;
 if (bool(main.auto_redirect, false)) tun.auto_redirect = true;
+// Destinations that must never enter the tunnel (Settings » Advanced). The case this exists for is
+// the management tunnel that gives you access to the router: if its traffic is routed into nxsb0,
+// the way in rides the tunnel it is supposed to reach the router through, every core reload cuts it,
+// and a broken subscription locks you out of a remote box entirely. A routing rule outside sing-box
+// can do the same job, but only while strict_route and auto_redirect are off - both work through
+// nftables and ignore ip rules. This is honoured whatever those are set to.
+delete tun.route_exclude_address;
+let tun_excl = nonempty(list(main.tun_exclude));
+if (length(tun_excl)) tun.route_exclude_address = tun_excl;
 
 // ---- DNS listener for dnsmasq (LAN DNS is answered by the core through hijack-dns).
 //      The port comes from Settings (single source of truth); the init script resolves collisions and
