@@ -276,6 +276,33 @@ reload_core() {
 	fi
 }
 
+# fw4 has no zone for the tunnel interface, so forwarded LAN traffic into it hits handle_reject
+# and the router stops serving the devices behind it. auto_redirect inserts its own compatibility
+# rules into fw4 and these would only duplicate them; without auto_redirect nothing inserts
+# anything and they are the only thing keeping the LAN alive. Owned here rather than shipped as
+# files, so the toggle and the firewall can never disagree.
+FW4_FWD=/usr/share/nftables.d/chain-pre/forward/10-nxsb.nft
+FW4_IN=/usr/share/nftables.d/chain-pre/input/10-nxsb.nft
+
+_fw4_compat() {
+	if [ "$1" = 1 ]; then                       # auto_redirect on: sing-box inserts its own
+		[ -f $FW4_FWD ] || [ -f $FW4_IN ] || return 0
+		rm -f $FW4_FWD $FW4_IN
+	else
+		mkdir -p "$(dirname $FW4_FWD)" "$(dirname $FW4_IN)"
+		cat > $FW4_FWD <<-EOF
+			# nxsb: fw4 puts the tunnel interface in no zone, so forwarded LAN traffic into it would hit handle_reject.
+			oifname "nxsb0" accept comment "nxsb: LAN -> tunnel"
+			iifname "nxsb0" accept comment "nxsb: tunnel -> LAN"
+		EOF
+		cat > $FW4_IN <<-EOF
+			# nxsb: packets the tunnel hands back to the router itself
+			iifname "nxsb0" accept comment "nxsb: tunnel -> router"
+		EOF
+	fi
+	fw4 reload >/dev/null 2>&1
+}
+
 start_service() {
 	config_load nxsb
 	local enabled hijack; config_get_bool enabled main enabled 0; config_get_bool hijack main hijack_lan_dns 1
@@ -285,6 +312,9 @@ start_service() {
 
 	[ -c /dev/net/tun ] || modprobe tun >/dev/null 2>&1
 	[ -c /dev/net/tun ] || { _event "ERROR no /dev/net/tun: install kmod-tun (Settings » Core » TUN module)"; return 1; }
+	# before the tun exists, so the LAN is never forwarded into an interface fw4 would reject
+	local ar; config_get_bool ar main auto_redirect 1
+	_fw4_compat "$ar"
 	_preflight
 	[ -d $RUN/core.lock ] || rm -f $BIN.new      # a leftover candidate, unless a core install is using it right now
 	rm -f $RUN/config.check.json
@@ -329,6 +359,8 @@ stop_service() {
 	[ "$DNS_CHANGED" = 1 ] && _dnsmasq_restart
 	# the cron line stays (autoupdate.sh does nothing while the service is off); postrm removes it
 	rm -f $CONF $RUN/dns.port $RUN/api.port
+	# nothing to accept once the interface is gone
+	rm -f $FW4_FWD $FW4_IN; fw4 reload >/dev/null 2>&1
 }
 
 reload_service() {
