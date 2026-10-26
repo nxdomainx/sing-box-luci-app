@@ -12,6 +12,7 @@ const RUN = '/etc/nxsb'; const STATE = '/var/run/nxsb';
 const SUB = `${RUN}/subscription.json`;
 const SUBSTATE = `${RUN}/sub.json`;        // source, last_update, last_error, nodes: state, not settings (never in uci)
 const ERR = `${STATE}/sub.err`;
+const DL = `${STATE}/sub.download`;        // raw body as downloaded (may be gzip); /var/run is RAM
 mkdir(RUN); mkdir(STATE);
 const logf = open(`${STATE}/sub.log`, 'w');
 function log(m) { if (logf) { logf.write(`${m}\n`); logf.flush(); } }
@@ -52,13 +53,26 @@ if (importFile != '') {
 } else {
 	if (!match(url, /^https?:\/\//)) fail('no subscription URL configured');
 	log(`fetching ${replace(url, /^(https?:\/\/[^\/?#]+).*/, '$1/…')} as ${ua}`);
-	// the body is the config, the downloader's own messages go to a file: without -q uclient-fetch says
+	// the body goes to DL and the downloader's own messages to ERR: without -q uclient-fetch says
 	// "HTTP error 404" / "Connection error"; with -q it says nothing at all
+	// the panel gzips config bodies whether or not we ask (it saves the edge's billed inbound), so curl asks
+	// for gzip and decodes it itself; uclient-fetch cannot, so a body that still starts with the gzip magic
+	// is unpacked with busybox gzip below
 	let curl = system('command -v curl >/dev/null 2>&1') == 0;
 	let cmd = curl
-		? `curl -fsSL -S -m 60 --max-filesize 4194304 -A ${shq(ua)} ${shq(url)} 2>${shq(ERR)}`
-		: `uclient-fetch -T 60 -U ${shq(ua)} -O - ${shq(url)} 2>${shq(ERR)}`;
-	let p = popen(cmd, 'r'); body = p ? p.read('all') : null; let rc = p ? p.close() : -1;
+		? `curl -fsSL -S -m 60 --compressed --max-filesize 4194304 -A ${shq(ua)} -o ${shq(DL)} ${shq(url)} 2>${shq(ERR)}`
+		: `uclient-fetch -T 60 -U ${shq(ua)} -O ${shq(DL)} ${shq(url)} 2>${shq(ERR)}`;
+	unlink(DL);
+	let rc = system(cmd);
+	body = readfile(DL);
+	if (rc == 0 && body != null && ord(body, 0) == 0x1f && ord(body, 1) == 0x8b) {   // gzip magic
+		let z = popen(`gzip -dc ${shq(DL)} 2>/dev/null`, 'r'); let plain = z ? z.read('all') : null; let zrc = z ? z.close() : -1;
+		unlink(DL);
+		if (zrc != 0 || plain == null || !length(plain)) fail('the panel sent a gzip body that could not be unpacked (is busybox gzip missing?)');
+		log(`unpacked a gzip body: ${length(body)} -> ${length(plain)} bytes`);
+		body = plain;
+	}
+	unlink(DL);
 	if (rc != 0 || body == null || !length(body)) {
 		let e = errline();
 		if (e == '') {
