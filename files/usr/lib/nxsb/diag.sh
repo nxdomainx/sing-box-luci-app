@@ -91,7 +91,14 @@ if [ -n "$sh" ]; then
 fi
 
 # ---- router ----
-if command -v nft >/dev/null 2>&1; then nft list chain inet fw4 forward 2>/dev/null | grep -q nxsb0 && ok "firewall accepts tunnel traffic (fw4 include loaded)" || fail "firewall include for the tunnel not loaded: run 'fw4 reload' or reinstall the package"
+if command -v nft >/dev/null 2>&1; then
+	ar="$(u auto_redirect)"; ar="${ar:-1}"
+	if [ "$ar" = 1 ]; then
+		# auto-redirect: the core installs its own nft rules; nothing of ours is in fw4
+		/etc/init.d/nxsb running 2>/dev/null && { nft list ruleset 2>/dev/null | grep -q 'auto_redirect\|sing-box' && ok "auto-redirect rules installed by the core" || fail "auto-redirect is on but the core installed no nft rules: LAN traffic is not being redirected. Restart the service; if it persists, check the Log page"; }
+	else
+		nft list chain inet fw4 forward 2>/dev/null | grep -q nxsb0 && ok "firewall accepts tunnel traffic (fw4 include loaded)" || fail "auto-redirect is off and the fw4 include for the tunnel is missing: run 'fw4 reload' or restart the service"
+	fi
 else warn "nft not found: firewall is not fw4, tunnel traffic may be blocked"; fi
 mem="$(awk '/^MemAvailable/ {print int($2/1024)}' /proc/meminfo)"; [ "${mem:-0}" -ge 60 ] && ok "RAM available: ${mem} MB" || warn "RAM available: ${mem} MB (the core needs ~70 MB, expect crashes)"
 fl="$(df -k /overlay 2>/dev/null | awk 'NR==2 {print int($4/1024)}')"; [ -n "$fl" ] && { [ "$fl" -ge 20 ] && ok "flash free: ${fl} MB" || warn "flash free: ${fl} MB (core upgrades need ~90 MB)"; }

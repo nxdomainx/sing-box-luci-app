@@ -47,7 +47,7 @@ tun.strict_route = false;              // a router forwards LAN traffic; strict 
 tun.stack = str(main.tun_stack, 'system');
 tun.mtu = str(main.tun_mtu, '') != '' ? +main.tun_mtu : 1500;
 delete tun.auto_redirect;
-if (bool(main.auto_redirect, false)) tun.auto_redirect = true;
+if (bool(main.auto_redirect, true)) tun.auto_redirect = true;   // default on, like the UI, the shipped config and init.d (unset after an upgrade over an older config)
 // Destinations that must never enter the tunnel (Settings » Advanced). The case this exists for is
 // the management tunnel that gives you access to the router: if its traffic is routed into nxsb0,
 // the way in rides the tunnel it is supposed to reach the router through, every core reload cuts it,
