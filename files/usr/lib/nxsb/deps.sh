@@ -206,7 +206,8 @@ import_ipk() {
 	echo running > $STATE/deps.state
 	trap '_abort' EXIT; trap 'exit 143' INT TERM
 	[ -s "$f" ] || { log "no file uploaded"; echo failed > $STATE/deps.state; return 1; }
-	ctl="$( (tar -xzOf "$f" ./control.tar.gz 2>/dev/null || tar -xzOf "$f" control.tar.gz 2>/dev/null) | tar -xzO ./control 2>/dev/null)"
+	# an ipk is a gzipped tar of tarballs; unpack with gzip, BusyBox tar may lack -z
+	ctl="$( (gzip -dc "$f" 2>/dev/null | tar -xOf - ./control.tar.gz 2>/dev/null || gzip -dc "$f" 2>/dev/null | tar -xOf - control.tar.gz 2>/dev/null) | gzip -dc 2>/dev/null | tar -xOf - ./control 2>/dev/null)"
 	pkg="$(echo "$ctl" | sed -n 's/^Package: //p')"
 	if [ -z "$pkg" ]; then logfail "not an ipk (no control file inside): $(basename "$f")"; echo failed > $STATE/deps.state; return 1; fi
 	case "$pkg" in kmod-tun) g=tun ;; kmod-tcp-bbr) g=bbr ;; *) logfail "this ipk is '$pkg', not kmod-tun or kmod-tcp-bbr"; echo failed > $STATE/deps.state; return 1 ;; esac

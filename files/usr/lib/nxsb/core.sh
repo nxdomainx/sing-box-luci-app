@@ -102,11 +102,13 @@ install_from_tar() { # tarfile
 	local tar=$1 tmpbin
 	tmpbin=$BIN.new
 	local member
-	member="$(tar -tzf "$tar" 2>$STATE/tar.err | grep -E '(^|/)sing-box$' | head -1)"
+	# gunzip with gzip, not tar -z: BusyBox tar on minimal images is built without gzip support
+	# ("tar: invalid option -- 'z'"), plain tar reading stdin works everywhere; gzip is a package dependency
+	member="$(gzip -dc "$tar" 2>$STATE/tar.err | tar -tf - 2>>$STATE/tar.err | grep -E '(^|/)sing-box$' | head -1)"
 	[ -n "$member" ] || die "tarball has no sing-box binary: $(tail -1 $STATE/tar.err 2>/dev/null || echo 'not a .tar.gz, or truncated')"
 	log "extracting $member"
 	# BusyBox tar: -O writes the member to stdout, so the 25MB tarball never needs unpacking to disk
-	tar -xzOf "$tar" "$member" > $tmpbin 2>$STATE/tar.err || { rm -f $tmpbin; die "extract failed: $(tail -1 $STATE/tar.err 2>/dev/null || echo 'flash full?')"; }
+	gzip -dc "$tar" 2>$STATE/tar.err | tar -xOf - "$member" > $tmpbin 2>>$STATE/tar.err && [ -s $tmpbin ] || { rm -f $tmpbin; die "extract failed: $(tail -1 $STATE/tar.err 2>/dev/null || echo 'flash full?')"; }
 	install_from_bin $tmpbin
 }
 
