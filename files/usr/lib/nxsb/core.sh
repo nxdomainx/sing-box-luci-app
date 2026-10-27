@@ -103,7 +103,7 @@ install_from_tar() { # tarfile
 	tmpbin=$BIN.new
 	local member
 	# gunzip with gzip, not tar -z: BusyBox tar on minimal images is built without gzip support
-	# ("tar: invalid option -- 'z'"), plain tar reading stdin works everywhere; gzip is a package dependency
+	# ("tar: invalid option -- 'z'"), plain tar reading stdin works everywhere; gzip is the BusyBox applet (not an opkg package: do not list it in Depends)
 	member="$(gzip -dc "$tar" 2>$STATE/tar.err | tar -tf - 2>>$STATE/tar.err | grep -E '(^|/)sing-box$' | head -1)"
 	[ -n "$member" ] || die "tarball has no sing-box binary: $(tail -1 $STATE/tar.err 2>/dev/null || echo 'not a .tar.gz, or truncated')"
 	log "extracting $member"
