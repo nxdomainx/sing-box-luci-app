@@ -2,16 +2,18 @@
 // nxsb: decide whether a freshly fetched subscription is worth restarting the core for.
 //   ucode subdiff.uc <applied.json> <new.json>   -> prints "same" | "defer <why>" | "restart <why>"
 //
-// The panel re-renders the config on every request, so the raw bytes differ almost every time without
-// anything meaningful having changed. Two sources of that noise:
+// A subscription can be rendered afresh on every fetch, so the raw bytes may differ without anything
+// meaningful having changed. Two sources of that noise:
 //   * ordering    - outbounds[] and the selector/urltest member lists come back in a different order.
-//   * the counter - the usage node's tag carries the traffic and days left ("4.8 GB | 11 ⏳"), so it is
-//                   renamed as the account is used, in the outbound and in every group that lists it.
+//   * status tags - an informational entry's tag can change between fetches, in the outbound and in every
+//                   group that lists it.
 // Both are cosmetic. A node is therefore identified by what it dials (everything but its tag), never by
 // its name, and every tag reference in the document is rewritten to that identity before comparing.
 //
-// What earns a restart: the outbound currently selected in some group is gone or now dials somewhere else,
-// or anything outside the outbound list moved (route rules, DNS, inbounds). Everything else - nodes added,
+// What earns a restart: the outbound currently selected in some group is gone, now dials somewhere else,
+// was RENAMED, or MOVED out of the group it is picked in (any hop of a nested pick); or anything outside
+// the outbound list moved (route rules, DNS, inbounds). Renames of nodes nobody is on stay invisible.
+// Everything else - nodes added,
 // removed or changed that nobody is on, a group's "default" - is stored and picked up the next time the
 // core restarts for its own reasons. A selector's default only decides a cold start; the live choice comes
 // back from cache.db, so it is not worth an interruption.
@@ -54,7 +56,7 @@ function node_ids(cfg) {
 }
 
 // rewrite every reference to a node's tag (its own tag field, group member lists, route rules) to that
-// node's identity, so renaming the counter node is invisible. Group tags are stable and stay as they are.
+// node's identity, so renaming a node is invisible here. Group tags are stable and stay as they are.
 function subst(v, m) {
 	let t = type(v);
 	if (t == 'string') return (m[v] != null) ? '#' + m[v] : v;
@@ -83,7 +85,7 @@ function outbound_view(cfg) {
 	return join('\n', sort(out));
 }
 
-// everything the panel sends that is not the outbound list: routing policy, DNS, inbounds, experimental
+// everything in the subscription that is not the outbound list: routing policy, DNS, inbounds, experimental
 function rest_view(cfg) {
 	let m = node_ids(cfg), o = {};
 	for (let k in cfg) if (k != 'outbounds') o[k] = cfg[k];
@@ -97,16 +99,30 @@ function selected() {
 	let g;
 	try { g = json(readfile(GROUPS)); } catch (e) { return null; }
 	if (type(g) != 'object' || type(g.groups) != 'array') return null;
-	let bytag = {}, out = {};
+	let bytag = {}, nodes = {}, hops = [];
 	for (let x in g.groups) if (type(x) == 'object' && x.tag != null) bytag[x.tag] = x;
 	for (let x in g.groups) {
 		if (type(x) != 'object' || x.type == 'urltest') continue;
-		let cur = x.now, hops = 0;
-		while (cur != null && bytag[cur] != null && hops++ < 8) {
-			if (bytag[cur].type == 'urltest') { cur = null; break; }   // the chain ends in a latency pick
-			cur = bytag[cur].now;
+		let cur = x.tag, n = 0;
+		while (cur != null && bytag[cur] != null && bytag[cur].type != 'urltest' && n++ < 8) {
+			let pick = bytag[cur].now;
+			if (pick == null) break;
+			push(hops, [cur, pick]);   // (group, what it is on): the pick must stay a member of that group
+			cur = pick;
 		}
-		if (cur != null && bytag[cur] == null) out[cur] = true;
+		if (cur != null && bytag[cur] == null) nodes[cur] = true;
+	}
+	return { hops: hops, nodes: nodes };
+}
+
+// group tag -> its members as identities (nodes by what they dial, groups by tag)
+function members(cfg, m) {
+	let out = {};
+	for (let o in arr(cfg.outbounds)) {
+		if (type(o) != 'object' || o.tag == null || !isgroup(o)) continue;
+		let set = {};
+		for (let x in arr(o.outbounds)) set[(m[x] != null) ? '#' + m[x] : x] = true;
+		out[o.tag] = set;
 	}
 	return out;
 }
@@ -125,21 +141,42 @@ if (!old || !new_) { print("restart no baseline to compare against\n"); exit(0);
 
 const ob_changed = outbound_view(old) != outbound_view(new_);
 const rest_changed = rest_view(old) != rest_view(new_);
+const oldm = node_ids(old), newm = node_ids(new_);
+// outbound_view hides renames on purpose; a rename of the node in use is checked below
+let renamed = false;
+for (let t in oldm) if (newm[t] == null) { renamed = true; break; }
+if (!renamed) for (let t in newm) if (oldm[t] == null) { renamed = true; break; }
 
-if (!ob_changed && !rest_changed) { print("same\n"); exit(0); }
+if (!ob_changed && !rest_changed && !renamed) { print("same\n"); exit(0); }
 if (rest_changed) { print("restart routing or DNS policy changed\n"); exit(0); }
 
-// outbounds moved: does it reach anything we are on?
+// outbounds moved or were renamed: does it reach anything we are on?
 const sel = selected();
-// the core is down or the mirror is not up yet: we cannot tell what is in use, so do not gamble
-if (sel == null) { print("restart nodes changed, selection unknown\n"); exit(0); }
+// the core is down or the mirror is not up yet: we cannot tell what is in use, so do not gamble,
+// unless only names moved (cosmetic, never worth a blind restart)
+if (sel == null) {
+	if (!ob_changed) { print("same\n"); exit(0); }
+	print("restart nodes changed, selection unknown\n"); exit(0);
+}
 
-const oldm = node_ids(old), newm = node_ids(new_);
+let otype = {};
+for (let o in arr(old.outbounds)) if (type(o) == 'object' && o.tag != null) otype[o.tag] = o.type;
 let live = {};
 for (let t in newm) live[newm[t]] = true;
-for (let tag in sel) {
+for (let tag in sel.nodes) {
 	let id = oldm[tag];
 	if (id == null) continue;                 // selected thing is not a plain node in the applied config
 	if (!live[id]) { print(`restart the selected node "${tag}" is gone or dials somewhere else now\n`); exit(0); }
+	if (newm[tag] == null && otype[tag] != 'direct' && otype[tag] != 'block') {
+		print(`restart the selected node "${tag}" was renamed\n`); exit(0);
+	}
 }
+const newg = members(new_, newm);
+for (let h in sel.hops) {
+	let grp = h[0], pick = h[1];
+	let ident = (oldm[pick] != null) ? '#' + oldm[pick] : pick;
+	if (newg[grp] == null) { print(`restart group "${grp}" (on "${pick}") is gone\n`); exit(0); }
+	if (!newg[grp][ident]) { print(`restart "${pick}" moved out of group "${grp}"\n`); exit(0); }
+}
+if (!ob_changed) { print("same\n"); exit(0); }   // only names of nodes nobody is on changed
 print("defer nodes changed, none of them in use\n");
