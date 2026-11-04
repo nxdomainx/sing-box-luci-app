@@ -3,9 +3,8 @@
 # restarts the core only if the stored config actually changed and the service is running.
 NOW="$(date +%s)"
 
-# core channel (stable/beta): look upstream once a day, upgrade when it moved; pinned never moves on its own
-CH="$(uci -q get nxsb.main.core_channel)"
-if [ -n "$CH" ] && [ "$CH" != pinned ]; then
+# core auto-update on: look up the channel (stable/beta) once a day, upgrade when it moved; off never moves
+if [ "$(uci -q get nxsb.main.core_autoupdate)" = 1 ]; then
 	STAMP=/etc/nxsb/core-check; LASTC="$(cat $STAMP 2>/dev/null)"; LASTC="${LASTC:-0}"
 	if [ $((NOW - LASTC)) -ge 86400 ]; then
 		mkdir -p /etc/nxsb; echo "$NOW" > $STAMP

@@ -31,6 +31,14 @@ if [ -n "$(uci -q get nxsb.main.sub_nodes)$(uci -q get nxsb.main.sub_last_update
 		"$(uci -q get nxsb.main.sub_last_error | sed 's/["\\]/./g')" "$(uci -q get nxsb.main.sub_nodes | grep . || echo 0)" > /etc/nxsb/sub.json
 	for k in sub_source sub_last_update sub_last_error sub_nodes; do uci -q delete nxsb.main.$k; done; uci commit nxsb
 fi
+# core update: one "Update track" (pinned|stable|beta) became an on/off switch plus a channel (0.1.8)
+if [ -z "$(uci -q get nxsb.main.core_autoupdate)" ]; then
+	case "$(uci -q get nxsb.main.core_channel)" in
+	stable|beta) uci set nxsb.main.core_autoupdate=1 ;;
+	*) uci set nxsb.main.core_autoupdate=0; uci set nxsb.main.core_channel=stable ;;
+	esac
+	uci commit nxsb
+fi
 # options earlier builds wrote that nothing reads any more
 for k in clash_api_port clash_api_secret; do uci -q delete nxsb.main.$k; done; uci commit nxsb
 

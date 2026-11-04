@@ -47,7 +47,12 @@ mirror() {
 	echo "${m:-$UPSTREAM}"
 }
 
-channel() { local c; c="$(uci -q get nxsb.main.core_channel)"; echo "${c:-pinned}"; }
+# auto-update off = pinned (the shipped version, never moves); on = the stable/beta channel. Only an explicit
+# 1 is on: LuCI drops an option saved at its default, so unset must mean off.
+channel() {
+	[ "$(uci -q get nxsb.main.core_autoupdate)" = 1 ] || { echo pinned; return; }
+	case "$(uci -q get nxsb.main.core_channel)" in beta) echo beta ;; *) echo stable ;; esac
+}
 
 # newest upstream version for a channel. github.com only (it is what the bootstrap pins cover), no API, no
 # rate limit: stable = where /releases/latest redirects to, beta = first entry of the releases feed.

@@ -103,8 +103,11 @@ return view.extend({
 				offlineHint(g)
 			]);
 		};
-		o = s.taboption('core', form.ListValue, 'core_channel', _('Update track'), _('Latest = looked up once a day and upgraded by itself; the service restarts when that happens.'));
-		o.value('pinned', _('%s (default)').format((guide || {}).version || '?')); o.value('stable', _('Latest stable')); o.value('beta', _('Latest beta')); o.default = 'pinned';
+		o = s.taboption('core', form.Flag, 'core_autoupdate', _('Auto-update core'), _('Off: the core stays on the version it was installed with (%s by default). On: the newest release of the channel below is looked up once a day and installed by itself; the service restarts when that happens.').format((guide || {}).version || '?'));
+		o.default = '0'; o.rmempty = false;
+		o = s.taboption('core', form.ListValue, 'core_channel', _('Update channel'));
+		o.value('stable', _('Stable')); o.value('beta', _('Beta')); o.default = 'stable'; o.rmempty = false;
+		o.depends('core_autoupdate', '1'); o.retain = true;   // keep the choice while auto-update is off
 		o = s.taboption('core', form.DummyValue, '_kmod', _('TUN module'));
 		o.rawhtml = true; o.cfgvalue = function() { var d = (status && status.deps) || {}; return kmodRow('tun', kmod || {}, !!d.tun); };
 		o = s.taboption('core', form.Flag, 'bbr', _('BBR congestion control'), _('Smoother uploads and video calls through the tunnel. Needs the module below; without it nothing changes.'));
