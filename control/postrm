@@ -3,7 +3,10 @@
 # opkg calls this with "remove" even for --force-reinstall and reports PKG_UPGRADE=0 there, so the
 # signal cannot tell a real removal from a reinstall/upgrade. Park the core and the data instead;
 # a postinst that runs within the grace period reclaims them, otherwise they are deleted.
+# (apk, OpenWrt 25.12+, runs this only on a real removal: an upgrade runs post-upgrade instead.)
 KEEP=/usr/bin/.nxsb-core.keep
+# the package manager of this box (opkg up to 24.10, apk from 25.12); this script cannot rely on /usr/lib/nxsb any more
+if [ -f /lib/apk/db/installed ] && command -v apk >/dev/null 2>&1; then PKGDEL='apk del'; else PKGDEL='opkg remove'; fi
 [ -x /usr/bin/nxsb ] && mv -f /usr/bin/nxsb $KEEP
 rm -f /usr/bin/nxsb.new /usr/bin/nxsb.prev /tmp/hosts/nxsb-bootstrap
 rm -rf /var/run/nxsb
@@ -25,7 +28,7 @@ done
 [ -n "$DNS6" ] && { uci commit dhcp; /etc/init.d/odhcpd reload >/dev/null 2>&1; }
 # congestion control: back to what it was. kmod-tcp-bbr fetched by this app carries its own sysctl file that
 # would re-select bbr at the next boot, so on a real removal that package goes too (after the grace period,
-# once opkg has released its lock); a kmod-tcp-bbr the user installed themselves stays.
+# once the package manager has released its lock); a kmod-tcp-bbr the user installed themselves stays.
 rm -f /etc/sysctl.d/99-nxsb-bbr.conf /etc/modules.d/99-nxsb-bbr
 CC="$(uci -q get nxsb.main.bbr_saved)"
 [ -n "$CC" ] && { sysctl -w net.ipv4.tcp_congestion_control="$CC" >/dev/null 2>&1 || ( echo "$CC" > /proc/sys/net/ipv4/tcp_congestion_control ) 2>/dev/null; }
@@ -36,12 +39,12 @@ OURS_BBR=0; [ -f /etc/nxsb/kmod-tcp-bbr.installed-by-nxsb ] && [ "$CC" != bbr ] 
 cat > /etc/uci-defaults/zz-nxsb-cleanup <<EOF
 [ -x /usr/lib/nxsb/core.sh ] && exit 0
 rm -f $KEEP; rm -rf /etc/nxsb
-[ $OURS_BBR = 1 ] && opkg remove kmod-tcp-bbr >/dev/null 2>&1
+[ $OURS_BBR = 1 ] && $PKGDEL kmod-tcp-bbr >/dev/null 2>&1
 logger -t nxsb "removed: cleanup done at boot"
 exit 0
 EOF
 ( sleep 120; [ -x /usr/lib/nxsb/core.sh ] && exit 0
 	rm -f $KEEP; rm -rf /etc/nxsb; rm -f /etc/uci-defaults/zz-nxsb-cleanup
-	if [ $OURS_BBR = 1 ]; then opkg remove kmod-tcp-bbr >/dev/null 2>&1 && logger -t nxsb "removed: kmod-tcp-bbr (installed by this app) removed, congestion control back to $CC" || logger -t nxsb "removed: could not remove kmod-tcp-bbr (opkg busy?); /etc/sysctl.d/12-tcp-bbr.conf will re-select bbr at boot"; fi
+	if [ $OURS_BBR = 1 ]; then $PKGDEL kmod-tcp-bbr >/dev/null 2>&1 && logger -t nxsb "removed: kmod-tcp-bbr (installed by this app) removed, congestion control back to $CC" || logger -t nxsb "removed: could not remove kmod-tcp-bbr ($PKGDEL failed, package manager busy?); /etc/sysctl.d/12-tcp-bbr.conf will re-select bbr at boot"; fi
 	logger -t nxsb "removed: parked core and /etc/nxsb deleted" ) >/dev/null 2>&1 </dev/null &
 exit 0

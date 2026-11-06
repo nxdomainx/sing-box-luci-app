@@ -3,12 +3,15 @@
 # open), so for the duration of a download the hostnames are pinned to known addresses (bootstrap-hosts).
 #
 #   deps.sh unpoison on|off       pin/unpin the download hostnames (no-op without dnsmasq)
-#   deps.sh kmod [tun|bbr|all]    opkg update + install kmod-tun / kmod-tcp-bbr (through the unpoisoned resolver)
+#   deps.sh kmod [tun|bbr|all]    package index update + install kmod-tun / kmod-tcp-bbr (opkg or apk, through the
+#                                 unpoisoned resolver)
 #   deps.sh bbr apply             congestion control as set in Settings » Core (bbr when the module is there)
 #   deps.sh status                json: tun device present, kmod-tun installed, bbr wanted/installed/active
-#   deps.sh guide [tun|bbr]       json: exact kmod ipk for this router (feed dir, file name, url)
-#   deps.sh import FILE           install an uploaded kmod-tun or kmod-tcp-bbr ipk
+#   deps.sh guide [tun|bbr]       json: exact kmod package for this router (feed dir, file name, url; .ipk or .apk)
+#   deps.sh import FILE           install an uploaded kmod-tun or kmod-tcp-bbr package (.ipk on opkg, .apk on apk)
 LIB=/usr/lib/nxsb
+. $LIB/pkg.sh
+PMLOG=/var/run/nxsb/pkg.log
 STATE=/var/run/nxsb
 EVENTS=/etc/nxsb/events.log
 mkdir -p $STATE
@@ -25,15 +28,14 @@ PROBE_github_com="https://github.com/SagerNet/sing-box/releases"
 _dnsmasq_reload() { [ -n "$(pidof dnsmasq)" ] && /etc/init.d/dnsmasq restart >/dev/null 2>&1; sleep 1; }
 _dnsmasq_hup() { [ -n "$(pidof dnsmasq)" ] && kill -HUP $(pidof dnsmasq) 2>/dev/null; sleep 1; }
 _probe() { uclient-fetch -q -O /dev/null -T 6 "$1" >/dev/null 2>&1; }
-# opkg's own fetch has no timeout: a poisoned or blackholed address would hang it forever
-# (BusyBox on most images has no timeout applet, so: run in background, kill after 300 s, plus opkg's wget child)
+# the package manager's own fetch has no usable timeout: a poisoned or blackholed address would hang it forever
+# (BusyBox on most images has no timeout applet, so: run in background, kill it and its download child after 300 s)
 _to() {
 	local pid n=0 c
 	"$@" & pid=$!
 	while kill -0 $pid 2>/dev/null; do
 		if [ $n -ge 300 ]; then
-			for c in $(ps w 2>/dev/null | awk '/[o]pkg-[A-Za-z0-9]+\// {print $1}'); do kill $c 2>/dev/null; done
-			kill $pid 2>/dev/null; sleep 1; kill -9 $pid 2>/dev/null; log "gave up after 300 s: $1 $2"; return 124
+			pm_kill_tree $pid; sleep 1; kill -9 $pid 2>/dev/null; log "gave up after 300 s: $(pm_name) $1 $2"; return 124
 		fi
 		sleep 1; n=$((n+1))
 	done
@@ -87,11 +89,10 @@ unpoison_off() {
 	[ $changed = 1 ] && _dnsmasq_reload
 	return 0
 }
+# the line that explains a failed install, opkg ("Collected errors", "Cannot") or apk ("ERROR:")
+_pmerr() { grep -m1 -E 'ERROR|Collected|Cannot|Failed|error|not found|unable' -A1 $PMLOG | grep -v '^ *$' | tail -1 | sed 's/^ *\* *//'; }
 _confdir() { local d; d="$(grep -h '^conf-dir=' /var/etc/dnsmasq.conf.* 2>/dev/null | head -1 | cut -d= -f2)"; echo "${d:-/tmp/dnsmasq.d}"; }
 
-# read the opkg status db directly: opkg refuses to run while another opkg holds the lock (e.g. inside our postinst)
-_pkg_version() { awk -v p="$1" '$1=="Package:"{cur=$2} cur==p && $1=="Version:"{print $2; exit}' /usr/lib/opkg/status 2>/dev/null; }
-_opkg_busy() { ! opkg list-installed >/dev/null 2>&1; }
 
 # installed = module file on disk (or built into the kernel); a module merely loaded in RAM is gone after a reboot
 tun_installed() { ls /lib/modules/*/tun.ko >/dev/null 2>&1 || grep -q "^tun " /lib/modules/$(uname -r)/modules.builtin 2>/dev/null || [ -n "$(grep -l "^tun" /etc/modules.d/* 2>/dev/null)" ]; }
@@ -149,27 +150,27 @@ kmod() {
 	# the pins and the lock are ours only from here on (a concurrent core download may own them until then)
 	trap 'unpoison_off; _abort' EXIT
 	unpoison_on
-	log "opkg update"
-	if ! _to opkg update >$STATE/opkg.log 2>&1; then log "opkg update failed: $(grep -m1 -E 'Collected|Cannot|Failed|error|not found' -A1 $STATE/opkg.log | tail -1)"; fi
+	log "$(pm_name) update"
+	if ! _to pm_update >$PMLOG 2>&1; then log "$(pm_name) update failed: $(_pmerr)"; fi
 	if [ $need_tun = 1 ]; then
-		log "opkg install kmod-tun"
-		if _to opkg install kmod-tun >>$STATE/opkg.log 2>&1 && tun_present; then log "kmod-tun installed"
-		elif [ -n "$(_pkg_version kmod-tun)" ]; then logfail "kmod-tun is installed but /dev/net/tun is still missing: reboot the router"; rc=1
-		else logfail "kmod-tun install failed: $(grep -m1 -E 'Collected|Cannot|Failed|error|not found' -A1 $STATE/opkg.log | tail -1)"; rc=1; fi
+		log "$(pm_name) install kmod-tun"
+		if _to pm_install kmod-tun >>$PMLOG 2>&1 && tun_present; then log "kmod-tun installed"
+		elif [ -n "$(pm_version kmod-tun)" ]; then logfail "kmod-tun is installed but /dev/net/tun is still missing: reboot the router"; rc=1
+		else logfail "kmod-tun install failed: $(_pmerr)"; rc=1; fi
 		# the user may already have pressed "Enable & start" while the module was still on its way
 		if [ $rc = 0 ] && [ "$(uci -q get nxsb.main.enabled)" = 1 ] && ! /etc/init.d/nxsb running 2>/dev/null; then
 			log "service is enabled and was waiting for the module: starting it"; /etc/init.d/nxsb start >/dev/null 2>&1
 		fi
 	fi
 	if [ $need_bbr = 1 ]; then
-		log "opkg install kmod-tcp-bbr"
-		if _to opkg install kmod-tcp-bbr >>$STATE/opkg.log 2>&1 && bbr_installed; then
+		log "$(pm_name) install kmod-tcp-bbr"
+		if _to pm_install kmod-tcp-bbr >>$PMLOG 2>&1 && bbr_installed; then
 			bbr_mark_ours
 			if ! bbr_wanted; then log "kmod-tcp-bbr installed; BBR is turned off in Settings » Core"
 			elif bbr_apply; then log "kmod-tcp-bbr installed, BBR active"
 			else log "kmod-tcp-bbr installed, but BBR could not be switched on (see above); Overview » BBR » Activate retries"; fi
 		else
-			logfail "kmod-tcp-bbr install failed: $(grep -m1 -E 'Collected|Cannot|Failed|error|not found' -A1 $STATE/opkg.log | tail -1)"
+			logfail "kmod-tcp-bbr install failed: $(_pmerr)"
 			[ "$what" = bbr ] && rc=1 || log "BBR stays off (uploads and calls work without it, just less smoothly); Settings » Core » BBR module"
 		fi
 	fi
@@ -178,52 +179,69 @@ kmod() {
 	return $rc
 }
 
-# The ipk must come from the kmods feed of this exact kernel build: distfeeds.conf carries that URL (24.10+
-# openwrt_kmods; older releases keep kmods in openwrt_core). File name = <pkg>_<kernel>-r<rev>_<arch>.ipk.
+# The package must come from the kmods feed of this exact kernel build: the feed list carries that URL (opkg
+# distfeeds.conf: 24.10+ openwrt_kmods, older releases openwrt_core; apk repositories.d/distfeeds.list: the
+# .../kmods/<kernel>/packages.adb line). File name: opkg <pkg>_<kernel>-r<rev>_<arch>.ipk, apk <pkg>-<kernel>-r<rev>.apk.
 # $1: tun (default) | bbr
 guide() {
 	local feed kver arch file pkg
 	case "$1" in bbr|tcp-bbr|kmod-tcp-bbr) pkg=kmod-tcp-bbr ;; *) pkg=kmod-tun ;; esac
-	feed="$(awk '$2=="openwrt_kmods"{print $3; exit}' /etc/opkg/distfeeds.conf 2>/dev/null)"
-	[ -n "$feed" ] || feed="$(awk '$2=="openwrt_core"{print $3; exit}' /etc/opkg/distfeeds.conf 2>/dev/null)"
-	# image built without distfeeds.conf: point at the release's kmods parent folder (the per-kernel subfolder
+	feed="$(pm_kmods_feed)"
+	# image built without a feed list: point at the release's kmods parent folder (the per-kernel subfolder
 	# name carries a hash we cannot know offline; the user picks the one matching uname -r)
 	[ -n "$feed" ] || feed="$(. /etc/os-release 2>/dev/null; v="${VERSION_ID:-${OPENWRT_RELEASE#OpenWrt }}"; v="${v%% *}"; [ -n "$v" ] && [ -n "$OPENWRT_BOARD" ] && echo "https://downloads.openwrt.org/releases/$v/targets/$OPENWRT_BOARD/kmods")"
-	kver="$(_pkg_version kernel | sed 's/~[0-9a-f]*//')"
+	kver="$(pm_version kernel | sed 's/~[0-9a-f]*//')"
 	[ -n "$kver" ] || kver="$(uname -r)-r1"
 	arch="$(. /etc/os-release 2>/dev/null; echo "$OPENWRT_ARCH")"
-	[ -n "$arch" ] || arch="$(opkg print-architecture 2>/dev/null | awk 'END{print $2}')"
-	file="${pkg}_${kver}_${arch}.ipk"
-	printf '{"pkg":"%s","feed":"%s","file":"%s","url":"%s","kernel":"%s","arch":"%s","release":"%s"}\n' \
-		"$pkg" "$feed" "$file" "$(case "$feed" in */kmods|*/packages) ;; ?*) echo "$feed/$file";; esac)" "$(uname -r)" "$arch" "$(. /etc/os-release 2>/dev/null; echo "$OPENWRT_RELEASE")"
+	[ -n "$arch" ] || arch="$(. $LIB/arch.sh; nxsb_openwrt_arch)"
+	file="$(pm_kmod_file "$pkg" "$kver" "$arch")"
+	printf '{"pkg":"%s","feed":"%s","file":"%s","url":"%s","kernel":"%s","arch":"%s","release":"%s","format":"%s"}\n' \
+		"$pkg" "$feed" "$file" "$(case "$feed" in */kmods|*/packages) ;; ?*) echo "$feed/$file";; esac)" "$(uname -r)" "$arch" "$(. /etc/os-release 2>/dev/null; echo "$OPENWRT_RELEASE")" "$(pm_ext)"
 }
 
-# uploaded ipk: check it really is kmod-tun or kmod-tcp-bbr before handing it to opkg (which then enforces the
-# kernel build match)
-import_ipk() {
-	local f="$1" ctl pkg arch want_arch kdep kver g
+# name / arch / kernel build of a package file, as "pkg arch kdep" (kdep empty if it declares none)
+_pkgfile_meta() {
+	local f="$1" ctl
+	case "$(pm_file_kind "$f")" in
+	ipk)
+		# an ipk is a gzipped tar of tarballs; unpack with gzip, BusyBox tar may lack -z
+		ctl="$( (gzip -dc "$f" 2>/dev/null | tar -xOf - ./control.tar.gz 2>/dev/null || gzip -dc "$f" 2>/dev/null | tar -xOf - control.tar.gz 2>/dev/null) | gzip -dc 2>/dev/null | tar -xOf - ./control 2>/dev/null)"
+		echo "$(echo "$ctl" | sed -n 's/^Package: //p') $(echo "$ctl" | sed -n 's/^Architecture: //p') $(echo "$ctl" | sed -n 's/.*kernel (= \([^)]*\)).*/\1/p')" ;;
+	apk)
+		command -v apk >/dev/null 2>&1 || return 1
+		apk adbdump "$f" 2>/dev/null | awk '/^info:/{i=1;next} /^[a-z]+:$/{i=0} i&&/^  name: /{n=$2} i&&/^  arch: /{a=$2} i&&/^    - kernel=/{sub(/^    - kernel=/,""); k=$0} END{print n" "a" "k}' ;;
+	esac
+}
+
+# uploaded package: check it really is kmod-tun or kmod-tcp-bbr, built for this router, before installing it
+# (opkg segfaults on a foreign-arch ipk instead of refusing it, so arch and kernel build are checked here)
+import_pkg() {
+	local f="$1" kind meta pkg arch want_arch kdep kver g
 	UNPOISON_OWNER=$$
 	echo running > $STATE/deps.state
 	trap '_abort' EXIT; trap 'exit 143' INT TERM
 	[ -s "$f" ] || { log "no file uploaded"; echo failed > $STATE/deps.state; return 1; }
-	# an ipk is a gzipped tar of tarballs; unpack with gzip, BusyBox tar may lack -z
-	ctl="$( (gzip -dc "$f" 2>/dev/null | tar -xOf - ./control.tar.gz 2>/dev/null || gzip -dc "$f" 2>/dev/null | tar -xOf - control.tar.gz 2>/dev/null) | gzip -dc 2>/dev/null | tar -xOf - ./control 2>/dev/null)"
-	pkg="$(echo "$ctl" | sed -n 's/^Package: //p')"
-	if [ -z "$pkg" ]; then logfail "not an ipk (no control file inside): $(basename "$f")"; echo failed > $STATE/deps.state; return 1; fi
-	case "$pkg" in kmod-tun) g=tun ;; kmod-tcp-bbr) g=bbr ;; *) logfail "this ipk is '$pkg', not kmod-tun or kmod-tcp-bbr"; echo failed > $STATE/deps.state; return 1 ;; esac
-	# opkg segfaults on a foreign-arch ipk instead of refusing it: check arch and kernel build here
-	arch="$(echo "$ctl" | sed -n 's/^Architecture: //p')"; want_arch="$(. /etc/os-release 2>/dev/null; echo "$OPENWRT_ARCH")"
-	if [ -n "$want_arch" ] && [ "$arch" != "$want_arch" ]; then
-		logfail "wrong build: this ipk is for $arch, this router is $want_arch"
+	kind="$(pm_file_kind "$f")"
+	if [ -z "$kind" ]; then logfail "not a package file (.ipk or .apk): $(basename "$f")"; echo failed > $STATE/deps.state; return 1; fi
+	if [ "$kind" != "$(pm_ext)" ]; then
+		logfail "this is an .$kind package, but this router installs .$(pm_ext) ($([ "$(pm_ext)" = apk ] && echo 'OpenWrt 25.12 or newer' || echo 'OpenWrt 24.10 or older'))"
+		log "get $(guide tun | sed -n 's/.*"file":"\([^"]*\)".*/\1/p') (or the kmod-tcp-bbr one) instead"; echo failed > $STATE/deps.state; return 1
+	fi
+	meta="$(_pkgfile_meta "$f")"; pkg="${meta%% *}"; meta="${meta#* }"; arch="${meta%% *}"; kdep="${meta#* }"; [ "$kdep" = "$arch" ] && kdep=""
+	if [ -z "$pkg" ]; then logfail "not a readable .$kind package: $(basename "$f")"; echo failed > $STATE/deps.state; return 1; fi
+	case "$pkg" in kmod-tun) g=tun ;; kmod-tcp-bbr) g=bbr ;; *) logfail "this package is '$pkg', not kmod-tun or kmod-tcp-bbr"; echo failed > $STATE/deps.state; return 1 ;; esac
+	want_arch="$(. /etc/os-release 2>/dev/null; echo "$OPENWRT_ARCH")"
+	if [ -n "$want_arch" ] && [ -n "$arch" ] && [ "$arch" != "$want_arch" ]; then
+		logfail "wrong build: this package is for $arch, this router is $want_arch"
 		log "get $(guide $g | sed -n 's/.*"file":"\([^"]*\)".*/\1/p') instead"; echo failed > $STATE/deps.state; return 1
 	fi
-	kdep="$(echo "$ctl" | sed -n 's/.*kernel (= \([^)]*\)).*/\1/p')"; kver="$(_pkg_version kernel)"
+	kver="$(pm_version kernel)"
 	if [ -n "$kdep" ] && [ -n "$kver" ] && [ "$kdep" != "$kver" ]; then
-		logfail "wrong kernel build: this ipk wants kernel $kdep, this router runs $kver"
+		logfail "wrong kernel build: this package wants kernel $kdep, this router runs $kver"
 		log "get $(guide $g | sed -n 's/.*"file":"\([^"]*\)".*/\1/p') instead"; echo failed > $STATE/deps.state; return 1
 	fi
-	log "opkg install $(basename "$f")"
-	if opkg install "$f" >$STATE/opkg.log 2>&1; then
+	log "$(pm_name) install $(basename "$f")"
+	if pm_install_file "$f" >$PMLOG 2>&1; then
 		if [ $g = tun ] && tun_present; then log "kmod-tun installed"; bbr_apply; echo done > $STATE/deps.state; return 0; fi
 		[ $g = bbr ] && bbr_installed && bbr_mark_ours
 		if [ $g = bbr ] && bbr_installed; then
@@ -233,17 +251,17 @@ import_ipk() {
 			echo done > $STATE/deps.state; return 0
 		fi
 	fi
-	logfail "install failed: $(grep -v '^ *$' $STATE/opkg.log | tail -1 | sed 's/^ *\* *//')"
-	log "the ipk must be the one from this router's own kmods feed ($(guide $g | sed -n 's/.*"file":"\([^"]*\)".*/\1/p'))"
+	logfail "install failed: $(_pmerr)"
+	log "the package must be the one from this router's own kmods feed ($(guide $g | sed -n 's/.*"file":"\([^"]*\)".*/\1/p'))"
 	echo failed > $STATE/deps.state; return 1
 }
 
-# from postinst: opkg is locked by the install that is running us, so the module install has to happen after it
-# exits. Fully detached (all fds closed) so opkg does not wait on us.
+# from the install script: the package manager is locked by the install that is running us, so the module install
+# has to happen after it exits. Fully detached (all fds closed) so it does not wait on us.
 kmod_deferred() {
 	echo running > $STATE/deps.state
-	log "module install queued until the running opkg finishes"
-	( n=0; while { pidof opkg >/dev/null 2>&1 || _opkg_busy; } && [ $n -lt 1800 ]; do sleep 2; n=$((n+1)); [ $((n % 30)) = 0 ] && echo running > $STATE/deps.state; done; $LIB/deps.sh kmod all ) </dev/null >/dev/null 2>>$STATE/deps.log &
+	log "module install queued until the running $(pm_name) finishes"
+	( n=0; while { pidof opkg >/dev/null 2>&1 || pidof apk >/dev/null 2>&1 || pm_busy; } && [ $n -lt 1800 ]; do sleep 2; n=$((n+1)); [ $((n % 30)) = 0 ] && echo running > $STATE/deps.state; done; $LIB/deps.sh kmod all ) </dev/null >/dev/null 2>>$STATE/deps.log &
 	echo $! > $STATE/deps.pid
 }
 
@@ -253,11 +271,11 @@ case "$1" in
 	kmod-deferred) kmod_deferred ;;
 	bbr) case "$2" in apply) bbr_apply ;; *) exit 2 ;; esac ;;
 	guide) guide "$2" ;;
-	import) import_ipk "$2" ;;
+	import) import_pkg "$2" ;;
 	status)
 		printf '{"tun":%s,"kmod_tun":%s,"bbr_wanted":%s,"bbr_installed":%s,"bbr_active":%s,"congestion":"%s","state":"%s"}\n' \
 			"$(tun_installed && [ -c /dev/net/tun ] && echo true || echo false)" \
-			"$([ -n "$(_pkg_version kmod-tun)" ] && echo true || echo false)" \
+			"$([ -n "$(pm_version kmod-tun)" ] && echo true || echo false)" \
 			"$(bbr_wanted && echo true || echo false)" "$(bbr_installed && echo true || echo false)" \
 			"$([ "$(bbr_current)" = bbr ] && echo true || echo false)" "$(bbr_current)" \
 			"$(cat $STATE/deps.state 2>/dev/null)" ;;

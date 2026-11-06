@@ -34,11 +34,16 @@ Tested on a Google Router running OpenWrt 24.10.
 
 ## Install
 
-1. Grab the latest `.ipk` from [releases](https://github.com/nxdomainx/sing-box-luci-app/releases/latest). One file, every build.
-2. In LuCI: `System » Software » Upload Package`. Or from a terminal:
+1. Grab the latest package from [releases](https://github.com/nxdomainx/sing-box-luci-app/releases/latest). One file per OpenWrt generation, every router model:
+   - **OpenWrt 24.10 and older** (opkg): the `.ipk`
+   - **OpenWrt 25.12 and newer** (apk): the `.apk`
+2. **24.10 and older:** in LuCI `System » Software » Upload Package`, or from a terminal. **25.12 and newer:** from a terminal only (LuCI's upload refuses packages that are not signed by OpenWrt):
 
 ```bash
-opkg install /tmp/nxdomainx-luci-app-sing-box_0.1.0_all.ipk
+# OpenWrt 24.10 and older
+opkg install /tmp/nxdomainx-luci-app-sing-box_<version>_all.ipk
+# OpenWrt 25.12 and newer (the package is not signed by OpenWrt, hence --allow-untrusted)
+apk add --allow-untrusted /tmp/nxdomainx-luci-app-sing-box-<version>.apk
 ```
 
 > **Note:** during install the router downloads the Sing-box core and the kernel modules from the internet, so it can take a while.
@@ -63,7 +68,8 @@ Log page » **Run diagnostics**, then **Copy report**. From a terminal:
 ## Remove
 
 ```bash
-opkg remove nxdomainx-luci-app-sing-box
+opkg remove nxdomainx-luci-app-sing-box   # OpenWrt 24.10 and older
+apk del nxdomainx-luci-app-sing-box       # OpenWrt 25.12 and newer
 ```
 
 ## For developers

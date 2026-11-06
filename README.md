@@ -36,9 +36,11 @@
 
 ## نصب و راه‌اندازی
 
-۱. آخرین نسخه ipk را از [ریلیزها](https://github.com/nxdomainx/sing-box-luci-app/releases/latest) دانلود کنید؛ یک فایل، مناسب همه بیلدها.
+۱. آخرین نسخه را از [ریلیزها](https://github.com/nxdomainx/sing-box-luci-app/releases/latest) دانلود کنید؛ برای هر نسل OpenWrt یک فایل، مناسب همه مدل‌های روتر:
+   - **OpenWrt 24.10 و قدیمی‌تر** (opkg): فایل `.ipk`
+   - **OpenWrt 25.12 و جدیدتر** (apk): فایل `.apk`
 
-۲. در LuCI این مسیر را باز کنید و فایل را نصب کنید:
+۲. **OpenWrt 24.10 و قدیمی‌تر:** در LuCI این مسیر را باز کنید و فایل را نصب کنید (یا با ترمینال). **OpenWrt 25.12 و جدیدتر:** فقط با ترمینال؛ آپلود LuCI بسته‌هایی را که امضای OpenWrt ندارند نصب نمی‌کند:
 
 <div dir="ltr">
 
@@ -51,7 +53,10 @@
 <div dir="ltr">
 
 ```bash
-opkg install /tmp/nxdomainx-luci-app-sing-box_0.1.0_all.ipk
+# OpenWrt 24.10 and older
+opkg install /tmp/nxdomainx-luci-app-sing-box_<version>_all.ipk
+# OpenWrt 25.12 and newer (not signed by OpenWrt, hence --allow-untrusted)
+apk add --allow-untrusted /tmp/nxdomainx-luci-app-sing-box-<version>.apk
 ```
 
 </div>
@@ -97,7 +102,8 @@ opkg install /tmp/nxdomainx-luci-app-sing-box_0.1.0_all.ipk
 <div dir="ltr">
 
 ```bash
-opkg remove nxdomainx-luci-app-sing-box
+opkg remove nxdomainx-luci-app-sing-box   # OpenWrt 24.10 and older
+apk del nxdomainx-luci-app-sing-box       # OpenWrt 25.12 and newer
 ```
 
 </div>

@@ -23,7 +23,7 @@ var callDestroy    = rpc.declare({ object: 'luci.nxsb', method: 'destroy_workdir
 // the two kernel modules the app can fetch or take as an upload; both come from the router's own kmods feed
 var KMOD = { tun: { pkg: 'kmod-tun', name: _('the TUN module') }, bbr: { pkg: 'kmod-tcp-bbr', name: _('the BBR module') } };
 // a failure that the offline guide can help with (everything else has its own reason to show)
-var NETWORK_FAIL = /download failed|opkg update failed|unreachable|no internet|not reachable|could not look up|Connection|timed out/i;
+var NETWORK_FAIL = /download failed|(opkg|apk) update failed|unreachable|no internet|not reachable|could not look up|Connection|timed out/i;
 
 return baseclass.extend({
 	badge: function(ok, text) {
@@ -83,7 +83,7 @@ return baseclass.extend({
 				if (r.state == 'done' || r.state == 'failed') finish(r.state);
 			}).catch(function(e) {
 				if (finished) return;
-				// one missed poll while opkg hogs the CPU is not a failure; three in a row is
+				// one missed poll while the package manager hogs the CPU is not a failure; three in a row is
 				if (++misses >= 3) { lastLog = lastLog.concat([ self.errText(e) ]); pre.textContent = lastLog.join('\n'); finish('failed'); }
 			});
 		}, 1000);

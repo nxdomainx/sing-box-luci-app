@@ -19,8 +19,9 @@ default_postinst $0 $@
 fw4 reload >/dev/null 2>&1
 rm -f /tmp/luci-indexcache /tmp/luci-modulecache/* 2>/dev/null
 
-# opkg's copy of the shipped config on upgrade: settings live in the existing file, new options have defaults in code
-rm -f /etc/config/nxsb-opkg
+# the package manager's copy of the shipped config on upgrade (opkg: nxsb-opkg, apk: nxsb.apk-new): settings live in
+# the existing file, new options have defaults in code
+rm -f /etc/config/nxsb-opkg /etc/config/nxsb.apk-new
 # a removal's boot-time cleanup fallback is moot once the package is back
 rm -f /etc/uci-defaults/zz-nxsb-cleanup
 # subscription state used to live in uci; it is a file now (never committed by a background job)
@@ -60,14 +61,14 @@ if [ -z "$missing" ]; then
 elif [ "${NXSB_SKIP_CORE}" = "1" ]; then
 	echo "nxsb: $missing missing, not installed (NXSB_SKIP_CORE=1). LuCI » Services » Sing-Box » Settings » Core"
 else
-	# opkg holds its lock while we run, so the feed install is queued to start right after this install finishes
+	# the package manager holds its lock while we run, so the feed install is queued to start right after this install finishes
 	/usr/lib/nxsb/deps.sh kmod-deferred
-	echo "nxsb: $missing missing; fetched from the OpenWrt feed as soon as this opkg run ends (about a minute)."
+	echo "nxsb: $missing missing; fetched from the OpenWrt feed as soon as this install ends (about a minute)."
 	echo "      Progress and result: LuCI » Services » Sing-Box. If that fails (no internet), install offline:"
 	for m in $missing; do
 		echo "      download $(/usr/lib/nxsb/deps.sh guide $m | sed -n 's/.*"url":"\([^"]*\)".*/\1/p')"
 	done
-	echo "      and upload in LuCI » Sing-Box » Settings » Core, or: /usr/lib/nxsb/deps.sh import /tmp/<file>.ipk"
+	echo "      and upload in LuCI » Sing-Box » Settings » Core, or: /usr/lib/nxsb/deps.sh import /tmp/<file>"
 fi
 
 # IPv6 DNS advertisement off from now on (Settings » LAN to turn it back on); see dns6.sh for why
